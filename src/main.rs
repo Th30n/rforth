@@ -3,6 +3,7 @@ use std::io::Write;
 
 const PTR_SIZE: usize = std::mem::size_of::<usize>();
 
+#[derive(Copy, Clone, PartialEq)]
 /// Entry in a Forth dictionary
 struct DictEntryRef<'a> {
     /// Points to start of the entry in DataSpace.
@@ -11,7 +12,7 @@ struct DictEntryRef<'a> {
     end_of_data_space: usize,
 }
 
-impl DictEntryRef<'_> {
+impl<'a> DictEntryRef<'a> {
     fn ptr_as_slice(&self) -> Option<&[u8]> {
         let ptr = self.ptr as *const u8;
         // TODO: Check if ptr is below DataSpace
@@ -22,7 +23,7 @@ impl DictEntryRef<'_> {
         }
     }
 
-    pub fn prev<'a>(&'a self) -> Option<DictEntryRef<'a>> {
+    pub fn prev(&self) -> Option<DictEntryRef<'a>> {
         let buf_slice = self.ptr_as_slice().unwrap();
         let prev_bytes = <[u8; PTR_SIZE]>::try_from(&buf_slice[0..PTR_SIZE]).unwrap();
         let prev_addr = usize::from_ne_bytes(prev_bytes);
@@ -117,12 +118,24 @@ impl DataSpace {
         }
     }
 
-    fn latest<'a>(&'a self) -> Option<DictEntryRef<'a>> {
+    fn latest_entry<'a>(&'a self) -> Option<DictEntryRef<'a>> {
         let maybe_entry = unsafe { self.dict_head.as_ref() };
         maybe_entry.map(|ptr| DictEntryRef {
             ptr: ptr,
             end_of_data_space: self.ptr as usize + self.size(),
         })
+    }
+
+    fn find_entry<'a>(&'a self, name: &str) -> Option<DictEntryRef<'a>> {
+        let mut maybe_entry = self.latest_entry();
+        while let Some(entry) = maybe_entry {
+            if entry.name() == name {
+                return maybe_entry;
+            } else {
+                maybe_entry = entry.prev();
+            }
+        }
+        None
     }
 }
 
@@ -134,15 +147,56 @@ impl Drop for DataSpace {
     }
 }
 
-fn main() {
+#[test]
+fn test_data_space_find_entry() {
     let mut data_space = DataSpace::with_size(1024);
+    assert!(data_space.find_entry("DUP").is_none());
+    data_space.push_dict_entry("DUP");
+    {
+        let maybe_dup = data_space.find_entry("DUP");
+        assert!(maybe_dup.is_some());
+        assert_eq!(maybe_dup.unwrap().name(), "DUP");
+        assert_eq!(maybe_dup, data_space.latest_entry());
+    }
+    data_space.push_dict_entry("SWAP");
+    {
+        let maybe_dup = data_space.find_entry("DUP");
+        assert!(maybe_dup.is_some());
+        assert_eq!(maybe_dup.unwrap().name(), "DUP");
+        assert_eq!(maybe_dup, data_space.latest_entry().unwrap().prev());
+    }
+    data_space.push_dict_entry("DUP");
+    {
+        let maybe_dup = data_space.find_entry("DUP");
+        assert!(maybe_dup.is_some());
+        assert_eq!(maybe_dup.unwrap().name(), "DUP");
+        assert_eq!(maybe_dup, data_space.latest_entry());
+        let orig_dup = data_space.latest_entry().unwrap().prev().unwrap().prev();
+        assert_eq!(maybe_dup.unwrap().name(), orig_dup.unwrap().name());
+        assert_ne!(maybe_dup, orig_dup);
+    }
+}
+
+struct ForthMachine {
+    data_space: DataSpace,
+    data_stack: Vec<isize>,
+    return_stack: Vec<isize>,
+}
+
+fn main() {
+    let mut forth_machine = ForthMachine {
+        data_space: DataSpace::with_size(1024),
+        data_stack: Vec::with_capacity(256),
+        return_stack: Vec::with_capacity(256),
+    };
+    let data_space = &mut forth_machine.data_space;
     println!("Data space ptr: {:p}", data_space.ptr);
     println!("Unused data space: {} bytes", data_space.unused());
     data_space.push_dict_entry("DUP");
-    let entry1 = data_space.latest().unwrap();
+    let entry1 = data_space.latest_entry().unwrap();
     println!("Dict entry 1 {:?}", entry1);
     println!("Unused data space: {} bytes", data_space.unused());
     data_space.push_dict_entry("SWAP");
-    let entry2 = data_space.latest().unwrap();
+    let entry2 = data_space.latest_entry().unwrap();
     println!("Dict entry 2 {:?}", entry2);
 }
