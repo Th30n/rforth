@@ -91,6 +91,16 @@ impl DataSpace {
         end - self.current as usize
     }
 
+    pub fn align(&mut self) {
+        assert_eq!(std::mem::align_of::<usize>(), PTR_SIZE);
+        let addr = self.current as usize;
+        let aligned_addr = (addr + (PTR_SIZE - 1)) & (!PTR_SIZE + 1);
+        assert_eq!(aligned_addr % PTR_SIZE, 0);
+        assert!(aligned_addr >= self.current as usize);
+        assert!(aligned_addr - self.current as usize <= self.unused());
+        self.current = aligned_addr as *mut u8;
+    }
+
     pub fn alloc<'a>(&'a mut self, bytes: usize) -> Option<&'a mut [u8]> {
         if bytes > self.unused() {
             None
@@ -118,7 +128,7 @@ impl DataSpace {
         }
     }
 
-    fn latest_entry<'a>(&'a self) -> Option<DictEntryRef<'a>> {
+    pub fn latest_entry<'a>(&'a self) -> Option<DictEntryRef<'a>> {
         let maybe_entry = unsafe { self.dict_head.as_ref() };
         maybe_entry.map(|ptr| DictEntryRef {
             ptr: ptr,
@@ -126,7 +136,7 @@ impl DataSpace {
         })
     }
 
-    fn find_entry<'a>(&'a self, name: &str) -> Option<DictEntryRef<'a>> {
+    pub fn find_entry<'a>(&'a self, name: &str) -> Option<DictEntryRef<'a>> {
         let mut maybe_entry = self.latest_entry();
         while let Some(entry) = maybe_entry {
             if entry.name() == name {
@@ -145,6 +155,26 @@ impl Drop for DataSpace {
             std::alloc::dealloc(self.ptr, self.layout);
         }
     }
+}
+
+#[test]
+fn test_data_space_align() {
+    let mut data_space = DataSpace::with_size(1024);
+    assert_eq!(data_space.unused(), 1024);
+    data_space.align();
+    assert_eq!(data_space.unused(), 1024);
+    data_space.alloc(8);
+    assert_eq!(data_space.unused(), 1024 - 8);
+    data_space.align();
+    assert_eq!(data_space.unused(), 1024 - 8);
+    data_space.alloc(1);
+    assert_eq!(data_space.unused(), 1024 - 9);
+    data_space.align();
+    assert_eq!(data_space.unused(), 1024 - 16);
+    data_space.alloc(7);
+    assert_eq!(data_space.unused(), 1024 - 16 - 7);
+    data_space.align();
+    assert_eq!(data_space.unused(), 1024 - 16 - 8);
 }
 
 #[test]
