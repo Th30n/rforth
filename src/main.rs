@@ -3,6 +3,14 @@ use std::io::Write;
 
 const PTR_SIZE: usize = std::mem::size_of::<usize>();
 
+fn align_addr(addr: usize) -> usize {
+    assert_eq!(std::mem::align_of::<usize>(), PTR_SIZE);
+    let aligned_addr = (addr + (PTR_SIZE - 1)) & (!PTR_SIZE + 1);
+    assert_eq!(aligned_addr % PTR_SIZE, 0);
+    assert!(aligned_addr >= addr);
+    aligned_addr
+}
+
 #[derive(Copy, Clone, PartialEq)]
 /// Entry in a Forth dictionary
 struct DictEntryRef<'a> {
@@ -39,6 +47,12 @@ impl<'a> DictEntryRef<'a> {
         let len = usize::from_ne_bytes(<[u8; PTR_SIZE]>::try_from(len_buf).unwrap());
         std::str::from_utf8(&name_buf[0..len]).unwrap()
     }
+
+    pub fn definition_addr(&self) -> usize {
+        let addr = align_addr(self.name().as_ptr() as usize + self.name().len());
+        assert!(addr < self.end_of_data_space);
+        addr
+    }
 }
 
 impl std::fmt::Debug for DictEntryRef<'_> {
@@ -57,6 +71,7 @@ impl std::fmt::Debug for DictEntryRef<'_> {
 /// Buffer for Forth's data space.
 ///
 /// Data space includes dictionary entries and user allocations.
+#[derive(Debug)]
 struct DataSpace {
     layout: std::alloc::Layout,
     ptr: *mut u8,
@@ -92,11 +107,7 @@ impl DataSpace {
     }
 
     pub fn align(&mut self) {
-        assert_eq!(std::mem::align_of::<usize>(), PTR_SIZE);
-        let addr = self.current as usize;
-        let aligned_addr = (addr + (PTR_SIZE - 1)) & (!PTR_SIZE + 1);
-        assert_eq!(aligned_addr % PTR_SIZE, 0);
-        assert!(aligned_addr >= self.current as usize);
+        let aligned_addr = align_addr(self.current as usize);
         assert!(aligned_addr - self.current as usize <= self.unused());
         self.current = aligned_addr as *mut u8;
     }
@@ -146,6 +157,17 @@ impl DataSpace {
             }
         }
         None
+    }
+
+    pub fn push_builtin_word(&mut self, name: &str, word_fn: fn(&mut ForthMachine)) {
+        self.push_dict_entry(name);
+        self.align();
+        {
+            let bytes = self.alloc(PTR_SIZE).unwrap();
+            let fn_addr = word_fn as usize;
+            let mut cursor = std::io::Cursor::new(bytes);
+            cursor.write_all(&fn_addr.to_ne_bytes()).unwrap();
+        }
     }
 }
 
@@ -207,26 +229,60 @@ fn test_data_space_find_entry() {
     }
 }
 
+#[derive(Debug)]
 struct ForthMachine {
     data_space: DataSpace,
     data_stack: Vec<isize>,
     return_stack: Vec<isize>,
+    instruction_addr: usize,
+}
+
+fn dup_builtin(forth: &mut ForthMachine) {
+    forth.data_stack.push(*forth.data_stack.last().unwrap());
+}
+
+fn next(forth: &mut ForthMachine) {
+    if forth.instruction_addr == 0 {
+        return;
+    }
+    // TODO: Check code_addr actually points to valid code.
+    let code_addr = unsafe { *(forth.instruction_addr as *const usize) };
+    let code_fun: fn(&mut ForthMachine) = unsafe { std::mem::transmute(code_addr as *const u8) };
+    forth.instruction_addr.checked_add(PTR_SIZE).unwrap();
+    code_fun(forth);
+}
+
+fn interpret(forth: &mut ForthMachine, word: &str) {
+    let maybe_definition_addr = forth
+        .data_space
+        .find_entry(word)
+        .map(|entry| entry.definition_addr());
+    if let Some(definition_addr) = maybe_definition_addr {
+        forth.instruction_addr = definition_addr;
+    } else {
+        forth.instruction_addr = 0;
+    }
 }
 
 fn main() {
-    let mut forth_machine = ForthMachine {
+    let mut forth = ForthMachine {
         data_space: DataSpace::with_size(1024),
         data_stack: Vec::with_capacity(256),
         return_stack: Vec::with_capacity(256),
+        instruction_addr: 0,
     };
-    let data_space = &mut forth_machine.data_space;
+    let data_space = &mut forth.data_space;
     println!("Data space ptr: {:p}", data_space.ptr);
     println!("Unused data space: {} bytes", data_space.unused());
-    data_space.push_dict_entry("DUP");
+    data_space.push_builtin_word("DUP", dup_builtin);
     let entry1 = data_space.latest_entry().unwrap();
     println!("Dict entry 1 {:?}", entry1);
     println!("Unused data space: {} bytes", data_space.unused());
     data_space.push_dict_entry("SWAP");
     let entry2 = data_space.latest_entry().unwrap();
     println!("Dict entry 2 {:?}", entry2);
+    forth.data_stack.push(1);
+    interpret(&mut forth, "DUP");
+    next(&mut forth);
+    println!("{:?}", forth);
 }
