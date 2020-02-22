@@ -21,76 +21,15 @@ fn is_within<T: Ord>(val: &T, lower: &T, upper: &T) -> bool {
     lower <= val && val < upper
 }
 
-#[derive(Copy, Clone, PartialEq)]
-/// Entry in a Forth dictionary
-struct DictEntryRef<'a> {
-    /// Points to start of the entry in DataSpace.
-    ptr: &'a u8,
-    /// Past the end adress of DataSpace
-    end_of_data_space: usize,
-}
-
-impl<'a> DictEntryRef<'a> {
-    fn ptr_as_slice(&self) -> Option<&[u8]> {
-        let ptr = self.ptr as *const u8;
-        // TODO: Check if ptr is below DataSpace
-        if ptr as usize >= self.end_of_data_space {
-            None
-        } else {
-            Some(unsafe { std::slice::from_raw_parts(ptr, self.end_of_data_space - ptr as usize) })
-        }
-    }
-
-    pub fn prev(&self) -> Option<DictEntryRef<'a>> {
-        let buf_slice = self.ptr_as_slice().unwrap();
-        let prev_bytes = <[u8; PTR_SIZE]>::try_from(&buf_slice[0..PTR_SIZE]).unwrap();
-        let prev_addr = usize::from_ne_bytes(prev_bytes);
-        let maybe_prev = unsafe { (prev_addr as *const u8).as_ref() };
-        maybe_prev.map(|prev| DictEntryRef {
-            ptr: prev,
-            end_of_data_space: self.end_of_data_space,
-        })
-    }
-
-    pub fn name(&self) -> &str {
-        let (len_buf, name_buf) = self.ptr_as_slice().unwrap()[PTR_SIZE..].split_at(PTR_SIZE);
-        let len = usize::from_ne_bytes(<[u8; PTR_SIZE]>::try_from(len_buf).unwrap());
-        std::str::from_utf8(&name_buf[0..len]).unwrap()
-    }
-
-    pub fn definition_addr(&self) -> usize {
-        let addr = align_addr(self.name().as_ptr() as usize + self.name().len());
-        assert!(addr < self.end_of_data_space);
-        addr
-    }
-}
-
-impl std::fmt::Debug for DictEntryRef<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "DictEntryRef {{ ptr: {:p}, end_of_data_space: {:p}, prev: {:p}, name: {} }}",
-            self.ptr as *const u8,
-            self.end_of_data_space as *const u8,
-            self.prev().map_or(std::ptr::null(), |e| e.ptr),
-            self.name()
-        )
-    }
-}
-
-/// Buffer for Forth's data space.
-///
-/// Data space includes dictionary entries and user allocations.
+/// Raw memory buffer with stack based allocation scheme.
 #[derive(Debug)]
-struct DataSpace {
+struct Memory {
     layout: std::alloc::Layout,
     ptr: *mut u8,
     current: *mut u8,
-    dict_head: *const u8,
-    builtin_addrs: Vec<usize>,
 }
 
-impl DataSpace {
+impl Memory {
     pub fn with_size(bytes: usize) -> Self {
         let layout = std::alloc::Layout::from_size_align(bytes, 8).unwrap();
         let ptr;
@@ -100,14 +39,10 @@ impl DataSpace {
                 std::alloc::handle_alloc_error(layout);
             }
         }
-        let mut builtin_addrs = Vec::with_capacity(64);
-        builtin_addrs.push(docol as usize);
-        DataSpace {
+        Memory {
             layout: layout,
             ptr: ptr,
             current: ptr,
-            dict_head: std::ptr::null(),
-            builtin_addrs: builtin_addrs,
         }
     }
 
@@ -120,20 +55,21 @@ impl DataSpace {
         end - self.current as usize
     }
 
-    pub fn is_allocd_addr(&self, addr: usize) -> bool {
-        is_within(&addr, &(self.ptr as usize), &(self.current as usize))
-    }
-
     pub fn is_valid_ptr<T>(&self, ptr: *const T) -> bool {
         let end = self.current as usize - std::mem::size_of::<T>() + 1;
         is_aligned(ptr as usize, std::mem::align_of::<T>())
             && is_within(&(ptr as usize), &(self.ptr as usize), &end)
     }
 
-    pub fn align(&mut self) {
+    #[must_use]
+    pub fn align(&mut self) -> bool {
         let aligned_addr = align_addr(self.current as usize);
-        assert!(aligned_addr - self.current as usize <= self.unused());
+        let end = self.ptr as usize + self.size();
+        if aligned_addr >= end {
+            return false;
+        }
         self.current = aligned_addr as *mut u8;
+        true
     }
 
     pub fn alloc<'a>(&'a mut self, bytes: usize) -> Option<&'a mut [u8]> {
@@ -148,26 +84,192 @@ impl DataSpace {
         }
     }
 
+    #[must_use]
+    pub fn dealloc(&mut self, bytes: usize) -> bool {
+        if bytes > self.current as usize - self.ptr as usize {
+            false
+        } else {
+            self.current = unsafe { self.current.sub(bytes) };
+            true
+        }
+    }
+}
+
+impl Drop for Memory {
+    fn drop(&mut self) {
+        unsafe {
+            std::alloc::dealloc(self.ptr, self.layout);
+        }
+    }
+}
+
+#[test]
+fn test_memory_align() {
+    let mut memory = Memory::with_size(1024);
+    assert_eq!(memory.unused(), 1024);
+    assert!(memory.align());
+    assert_eq!(memory.unused(), 1024);
+    memory.alloc(8);
+    assert_eq!(memory.unused(), 1024 - 8);
+    assert!(memory.align());
+    assert_eq!(memory.unused(), 1024 - 8);
+    memory.alloc(1);
+    assert_eq!(memory.unused(), 1024 - 9);
+    assert!(memory.align());
+    assert_eq!(memory.unused(), 1024 - 16);
+    memory.alloc(7);
+    assert_eq!(memory.unused(), 1024 - 16 - 7);
+    assert!(memory.align());
+    assert_eq!(memory.unused(), 1024 - 16 - 8);
+}
+
+/// Entry in a Forth dictionary
+#[derive(Copy, Clone)]
+struct DictEntryRef<'a> {
+    data_space: &'a DataSpace,
+    /// Points to start of the entry in DataSpace.
+    ptr: &'a u8,
+}
+
+impl<'a> DictEntryRef<'a> {
+    fn ptr_as_slice(&self) -> &[u8] {
+        let ptr = self.ptr as *const u8;
+        assert!(self.data_space.is_valid_ptr(ptr));
+        unsafe { std::slice::from_raw_parts(ptr, self.data_space.end() - ptr as usize) }
+    }
+
+    pub fn prev(&self) -> Option<DictEntryRef<'a>> {
+        let buf_slice = self.ptr_as_slice();
+        let prev_bytes = <[u8; PTR_SIZE]>::try_from(&buf_slice[0..PTR_SIZE]).unwrap();
+        let prev_ptr = usize::from_ne_bytes(prev_bytes) as *const u8;
+        if prev_ptr.is_null() {
+            None
+        } else {
+            // TODO: Make this assertion an actionable error, as it is possible
+            // to overwrite the prev_addr to something invalid in Forth.
+            assert!(self.data_space.is_valid_ptr(prev_ptr));
+            let prev = unsafe { &*prev_ptr };
+            Some(DictEntryRef {
+                data_space: self.data_space,
+                ptr: prev,
+            })
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        let (len_buf, name_buf) = self.ptr_as_slice()[PTR_SIZE..].split_at(PTR_SIZE);
+        let len = usize::from_ne_bytes(<[u8; PTR_SIZE]>::try_from(len_buf).unwrap());
+        std::str::from_utf8(&name_buf[0..len]).unwrap()
+    }
+
+    pub fn definition_addr(&self) -> usize {
+        let addr = align_addr(self.name().as_ptr() as usize + self.name().len());
+        assert!(self.data_space.is_valid_ptr(addr as *const usize));
+        addr
+    }
+}
+
+impl std::fmt::Debug for DictEntryRef<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "DictEntryRef {{ ptr: {:p}, end_of_data_space: {:p}, prev: {:p}, name: {} }}",
+            self.ptr as *const u8,
+            self.data_space.end() as *const u8,
+            self.prev().map_or(std::ptr::null(), |e| e.ptr),
+            self.name()
+        )
+    }
+}
+
+/// Memory for Forth's data space.
+///
+/// Data space includes dictionary entries and user allocations.
+#[derive(Debug)]
+struct DataSpace {
+    memory: Memory,
+    dict_head: *const u8,
+    builtin_addrs: Vec<usize>,
+}
+
+impl DataSpace {
+    pub fn with_size(bytes: usize) -> Self {
+        let mut builtin_addrs = Vec::with_capacity(64);
+        builtin_addrs.push(docol as usize);
+        DataSpace {
+            memory: Memory::with_size(bytes),
+            dict_head: std::ptr::null(),
+            builtin_addrs: builtin_addrs,
+        }
+    }
+
+    pub fn size(&self) -> usize {
+        self.memory.size()
+    }
+
+    /// Past the end adress of DataSpace
+    pub fn end(&self) -> usize {
+        self.memory.ptr as usize + self.size()
+    }
+
+    pub fn unused(&self) -> usize {
+        self.memory.unused()
+    }
+
+    pub fn is_valid_ptr<T>(&self, ptr: *const T) -> bool {
+        self.memory.is_valid_ptr(ptr)
+    }
+
+    #[must_use]
+    pub fn align(&mut self) -> bool {
+        self.memory.align()
+    }
+
+    pub fn alloc<'a>(&'a mut self, bytes: usize) -> Option<&'a mut [u8]> {
+        self.memory.alloc(bytes)
+    }
+
+    #[must_use]
+    pub fn dealloc(&mut self, bytes: usize) -> bool {
+        // TODO: Remove obsolete entries
+        let succ = self.memory.dealloc(bytes);
+        assert!(self.dict_head.is_null() || self.is_valid_ptr(self.dict_head));
+        succ
+    }
+
+    /// Allocate a new entry in the dictionary with given `name`.
+    /// The entry is padded, so that the next allocation is aligned.
+    #[must_use]
     pub fn push_dict_entry(&mut self, name: &str) -> bool {
         let prev_addr = self.dict_head as usize;
-        match self.alloc(PTR_SIZE + PTR_SIZE + name.len()) {
+        let entry_size = PTR_SIZE + PTR_SIZE + name.len();
+        match self.alloc(entry_size) {
             None => false,
             Some(buf) => {
                 let mut cursor = std::io::Cursor::new(buf);
                 cursor.write_all(&prev_addr.to_ne_bytes()).unwrap();
                 cursor.write_all(&name.len().to_ne_bytes()).unwrap();
                 cursor.write_all(name.as_bytes()).unwrap();
-                self.dict_head = cursor.into_inner().as_ptr();
-                true
+                let entry_ptr = cursor.into_inner().as_ptr();
+                if !self.align() {
+                    assert!(self.dealloc(entry_size));
+                    false
+                } else {
+                    self.dict_head = entry_ptr;
+                    true
+                }
             }
         }
     }
 
     pub fn latest_entry<'a>(&'a self) -> Option<DictEntryRef<'a>> {
         let maybe_entry = unsafe { self.dict_head.as_ref() };
-        maybe_entry.map(|ptr| DictEntryRef {
-            ptr: ptr,
-            end_of_data_space: self.ptr as usize + self.size(),
+        maybe_entry.map(|ptr| {
+            assert!(self.is_valid_ptr(ptr as *const u8));
+            DictEntryRef {
+                data_space: self,
+                ptr: ptr,
+            }
         })
     }
 
@@ -188,8 +290,7 @@ impl DataSpace {
     }
 
     pub fn push_builtin_word(&mut self, name: &str, word_fn: fn(&mut ForthMachine)) {
-        self.push_dict_entry(name);
-        self.align();
+        assert!(self.push_dict_entry(name));
         {
             let fn_addr = word_fn as usize;
             if !self.is_builtin_addr(fn_addr) {
@@ -202,61 +303,38 @@ impl DataSpace {
     }
 }
 
-impl Drop for DataSpace {
-    fn drop(&mut self) {
-        unsafe {
-            std::alloc::dealloc(self.ptr, self.layout);
-        }
-    }
-}
-
-#[test]
-fn test_data_space_align() {
-    let mut data_space = DataSpace::with_size(1024);
-    assert_eq!(data_space.unused(), 1024);
-    data_space.align();
-    assert_eq!(data_space.unused(), 1024);
-    data_space.alloc(8);
-    assert_eq!(data_space.unused(), 1024 - 8);
-    data_space.align();
-    assert_eq!(data_space.unused(), 1024 - 8);
-    data_space.alloc(1);
-    assert_eq!(data_space.unused(), 1024 - 9);
-    data_space.align();
-    assert_eq!(data_space.unused(), 1024 - 16);
-    data_space.alloc(7);
-    assert_eq!(data_space.unused(), 1024 - 16 - 7);
-    data_space.align();
-    assert_eq!(data_space.unused(), 1024 - 16 - 8);
-}
-
 #[test]
 fn test_data_space_find_entry() {
     let mut data_space = DataSpace::with_size(1024);
     assert!(data_space.find_entry("DUP").is_none());
-    data_space.push_dict_entry("DUP");
+    assert!(data_space.push_dict_entry("DUP"));
     {
-        let maybe_dup = data_space.find_entry("DUP");
-        assert!(maybe_dup.is_some());
-        assert_eq!(maybe_dup.unwrap().name(), "DUP");
-        assert_eq!(maybe_dup, data_space.latest_entry());
+        let dup = data_space.find_entry("DUP").unwrap();
+        assert_eq!(dup.name(), "DUP");
+        let latest = data_space.latest_entry().unwrap();
+        assert!(std::ptr::eq(dup.ptr, latest.ptr));
     }
-    data_space.push_dict_entry("SWAP");
+    assert!(data_space.push_dict_entry("SWAP"));
     {
-        let maybe_dup = data_space.find_entry("DUP");
-        assert!(maybe_dup.is_some());
-        assert_eq!(maybe_dup.unwrap().name(), "DUP");
-        assert_eq!(maybe_dup, data_space.latest_entry().unwrap().prev());
+        let dup = data_space.find_entry("DUP").unwrap();
+        assert_eq!(dup.name(), "DUP");
+        let latest = data_space.latest_entry().unwrap();
+        assert!(!std::ptr::eq(dup.ptr, latest.ptr));
+        assert!(std::ptr::eq(dup.ptr, latest.prev().unwrap().ptr));
     }
-    data_space.push_dict_entry("DUP");
+    assert!(data_space.push_dict_entry("DUP"));
     {
-        let maybe_dup = data_space.find_entry("DUP");
-        assert!(maybe_dup.is_some());
-        assert_eq!(maybe_dup.unwrap().name(), "DUP");
-        assert_eq!(maybe_dup, data_space.latest_entry());
-        let orig_dup = data_space.latest_entry().unwrap().prev().unwrap().prev();
-        assert_eq!(maybe_dup.unwrap().name(), orig_dup.unwrap().name());
-        assert_ne!(maybe_dup, orig_dup);
+        let dup = data_space.find_entry("DUP").unwrap();
+        assert_eq!(dup.name(), "DUP");
+        let latest = data_space.latest_entry().unwrap();
+        assert!(std::ptr::eq(dup.ptr, latest.ptr));
+        let orig_dup = data_space
+            .latest_entry()
+            .and_then(|e| e.prev())
+            .and_then(|e| e.prev())
+            .unwrap();
+        assert_eq!(dup.name(), orig_dup.name());
+        assert!(!std::ptr::eq(dup.ptr, orig_dup.ptr));
     }
 }
 
@@ -358,7 +436,7 @@ fn compile_word(data_space: &mut DataSpace, word: &str) -> usize {
 }
 
 fn push_instruction(data_space: &mut DataSpace, def_addr: usize) -> usize {
-    assert!(is_aligned(data_space.current as usize, PTR_SIZE));
+    assert!(is_aligned(data_space.memory.current as usize, PTR_SIZE));
     let instruction_buf = data_space.alloc(PTR_SIZE).unwrap();
     let mut cursor = std::io::Cursor::new(instruction_buf);
     cursor.write_all(&def_addr.to_ne_bytes()).unwrap();
@@ -369,8 +447,7 @@ fn push_word<'a, I>(data_space: &mut DataSpace, name: &str, words: I)
 where
     I: Iterator<Item = &'a str>,
 {
-    data_space.push_dict_entry(name);
-    data_space.align();
+    assert!(data_space.push_dict_entry(name));
     push_instruction(data_space, docol as usize);
     for word in words {
         let def_addr = compile_word(data_space, word);
@@ -384,7 +461,7 @@ fn set_instructions<'a, I>(forth: &mut ForthMachine, words: I)
 where
     I: Iterator<Item = &'a str>,
 {
-    forth.data_space.align();
+    assert!(forth.data_space.align());
     for word in words {
         let def_addr = compile_word(&mut forth.data_space, word);
         let instruction_addr = push_instruction(&mut forth.data_space, def_addr);
