@@ -100,12 +100,14 @@ impl DataSpace {
                 std::alloc::handle_alloc_error(layout);
             }
         }
+        let mut builtin_addrs = Vec::with_capacity(64);
+        builtin_addrs.push(docol as usize);
         DataSpace {
             layout: layout,
             ptr: ptr,
             current: ptr,
             dict_head: std::ptr::null(),
-            builtin_addrs: Vec::with_capacity(64),
+            builtin_addrs: builtin_addrs,
         }
     }
 
@@ -348,16 +350,34 @@ fn interpret(forth: &mut ForthMachine, word: &str) {
     }
 }
 
-fn push_instruction(data_space: &mut DataSpace, word: &str) -> usize {
-    let def_addr = data_space
+fn compile_word(data_space: &mut DataSpace, word: &str) -> usize {
+    data_space
         .find_entry(word)
         .map(|entry| entry.definition_addr())
-        .unwrap();
+        .unwrap()
+}
+
+fn push_instruction(data_space: &mut DataSpace, def_addr: usize) -> usize {
     assert!(is_aligned(data_space.current as usize, PTR_SIZE));
     let instruction_buf = data_space.alloc(PTR_SIZE).unwrap();
     let mut cursor = std::io::Cursor::new(instruction_buf);
     cursor.write_all(&def_addr.to_ne_bytes()).unwrap();
     cursor.into_inner().as_ptr() as usize
+}
+
+fn push_word<'a, I>(data_space: &mut DataSpace, name: &str, words: I)
+where
+    I: Iterator<Item = &'a str>,
+{
+    data_space.push_dict_entry(name);
+    data_space.align();
+    push_instruction(data_space, docol as usize);
+    for word in words {
+        let def_addr = compile_word(data_space, word);
+        push_instruction(data_space, def_addr);
+    }
+    let def_addr = compile_word(data_space, "EXIT");
+    push_instruction(data_space, def_addr);
 }
 
 fn set_instructions<'a, I>(forth: &mut ForthMachine, words: I)
@@ -366,12 +386,14 @@ where
 {
     forth.data_space.align();
     for word in words {
-        let instruction_addr = push_instruction(&mut forth.data_space, word);
+        let def_addr = compile_word(&mut forth.data_space, word);
+        let instruction_addr = push_instruction(&mut forth.data_space, def_addr);
         if forth.instruction_addr == 0 {
             forth.instruction_addr = instruction_addr;
         }
     }
-    push_instruction(&mut forth.data_space, "BYE");
+    let def_addr = compile_word(&mut forth.data_space, "BYE");
+    push_instruction(&mut forth.data_space, def_addr);
 }
 
 fn main() {
@@ -382,7 +404,12 @@ fn main() {
     );
     forth.data_stack.push(1);
     forth.data_stack.push(2);
-    set_instructions(&mut forth, ["SWAP", "DUP"].iter().map(|s| *s));
+    push_word(
+        &mut forth.data_space,
+        "GO",
+        ["SWAP", "DUP"].iter().map(|s| *s),
+    );
+    set_instructions(&mut forth, ["GO"].iter().map(|s| *s));
     while forth.instruction_addr != 0 {
         next(&mut forth);
     }
