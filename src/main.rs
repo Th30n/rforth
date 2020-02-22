@@ -3,12 +3,22 @@ use std::io::Write;
 
 const PTR_SIZE: usize = std::mem::size_of::<usize>();
 
+fn is_aligned(addr: usize, alignment: usize) -> bool {
+    addr % alignment == 0
+}
+
 fn align_addr(addr: usize) -> usize {
     assert_eq!(std::mem::align_of::<usize>(), PTR_SIZE);
     let aligned_addr = (addr + (PTR_SIZE - 1)) & (!PTR_SIZE + 1);
-    assert_eq!(aligned_addr % PTR_SIZE, 0);
+    assert!(is_aligned(aligned_addr, PTR_SIZE));
     assert!(aligned_addr >= addr);
     aligned_addr
+}
+
+/// Return true if `val` is within [lower, upper).
+fn is_within<T: Ord>(val: &T, lower: &T, upper: &T) -> bool {
+    assert!(lower <= upper);
+    lower <= val && val < upper
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -77,6 +87,7 @@ struct DataSpace {
     ptr: *mut u8,
     current: *mut u8,
     dict_head: *const u8,
+    builtin_addrs: Vec<usize>,
 }
 
 impl DataSpace {
@@ -94,6 +105,7 @@ impl DataSpace {
             ptr: ptr,
             current: ptr,
             dict_head: std::ptr::null(),
+            builtin_addrs: Vec::with_capacity(64),
         }
     }
 
@@ -104,6 +116,16 @@ impl DataSpace {
     pub fn unused(&self) -> usize {
         let end = self.ptr as usize + self.size();
         end - self.current as usize
+    }
+
+    pub fn is_allocd_addr(&self, addr: usize) -> bool {
+        is_within(&addr, &(self.ptr as usize), &(self.current as usize))
+    }
+
+    pub fn is_valid_ptr<T>(&self, ptr: *const T) -> bool {
+        let end = self.current as usize - std::mem::size_of::<T>() + 1;
+        is_aligned(ptr as usize, std::mem::align_of::<T>())
+            && is_within(&(ptr as usize), &(self.ptr as usize), &end)
     }
 
     pub fn align(&mut self) {
@@ -159,12 +181,19 @@ impl DataSpace {
         None
     }
 
+    pub fn is_builtin_addr(&self, addr: usize) -> bool {
+        self.builtin_addrs.contains(&addr)
+    }
+
     pub fn push_builtin_word(&mut self, name: &str, word_fn: fn(&mut ForthMachine)) {
         self.push_dict_entry(name);
         self.align();
         {
-            let bytes = self.alloc(PTR_SIZE).unwrap();
             let fn_addr = word_fn as usize;
+            if !self.is_builtin_addr(fn_addr) {
+                self.builtin_addrs.push(fn_addr);
+            }
+            let bytes = self.alloc(PTR_SIZE).unwrap();
             let mut cursor = std::io::Cursor::new(bytes);
             cursor.write_all(&fn_addr.to_ne_bytes()).unwrap();
         }
@@ -238,6 +267,10 @@ struct ForthMachine {
     instruction_addr: usize,
 }
 
+fn bye_builtin(forth: &mut ForthMachine) {
+    forth.instruction_addr = 0;
+}
+
 fn dup_builtin(forth: &mut ForthMachine) {
     forth.data_stack.push(*forth.data_stack.last().unwrap());
 }
@@ -249,7 +282,7 @@ fn swap_builtin(forth: &mut ForthMachine) {
     forth.data_stack.push(b);
 }
 
-fn docol_builtin(forth: &mut ForthMachine) {
+fn docol(forth: &mut ForthMachine) {
     forth.return_stack.push(forth.instruction_addr as isize);
     forth.instruction_addr = forth.curr_def_addr.checked_add(PTR_SIZE).unwrap();
 }
@@ -259,9 +292,9 @@ fn exit_builtin(forth: &mut ForthMachine) {
 }
 
 fn add_builtins(data_space: &mut DataSpace) {
+    data_space.push_builtin_word("BYE", bye_builtin);
     data_space.push_builtin_word("DUP", dup_builtin);
     data_space.push_builtin_word("SWAP", swap_builtin);
-    data_space.push_builtin_word("DOCOL", docol_builtin);
     data_space.push_builtin_word("EXIT", exit_builtin);
 }
 
@@ -283,8 +316,9 @@ impl ForthMachine {
 }
 
 fn exec_fun_indirect(addr: usize, forth: &mut ForthMachine) {
-    // TODO: Check addr & fun_addr actually points to valid code.
+    assert!(forth.data_space.is_valid_ptr(addr as *const usize));
     let fun_addr = unsafe { *(addr as *const usize) };
+    assert!(forth.data_space.is_builtin_addr(fun_addr));
     let fun: fn(&mut ForthMachine) = unsafe { std::mem::transmute(fun_addr as *const u8) };
     return fun(forth);
 }
@@ -293,6 +327,9 @@ fn next(forth: &mut ForthMachine) {
     if forth.instruction_addr == 0 {
         return;
     }
+    assert!(forth
+        .data_space
+        .is_valid_ptr(forth.instruction_addr as *const usize));
     let def_addr = unsafe { *(forth.instruction_addr as *const usize) };
     forth.curr_def_addr = def_addr;
     forth.instruction_addr = forth.instruction_addr.checked_add(PTR_SIZE).unwrap();
@@ -311,6 +348,32 @@ fn interpret(forth: &mut ForthMachine, word: &str) {
     }
 }
 
+fn push_instruction(data_space: &mut DataSpace, word: &str) -> usize {
+    let def_addr = data_space
+        .find_entry(word)
+        .map(|entry| entry.definition_addr())
+        .unwrap();
+    assert!(is_aligned(data_space.current as usize, PTR_SIZE));
+    let instruction_buf = data_space.alloc(PTR_SIZE).unwrap();
+    let mut cursor = std::io::Cursor::new(instruction_buf);
+    cursor.write_all(&def_addr.to_ne_bytes()).unwrap();
+    cursor.into_inner().as_ptr() as usize
+}
+
+fn set_instructions<'a, I>(forth: &mut ForthMachine, words: I)
+where
+    I: Iterator<Item = &'a str>,
+{
+    forth.data_space.align();
+    for word in words {
+        let instruction_addr = push_instruction(&mut forth.data_space, word);
+        if forth.instruction_addr == 0 {
+            forth.instruction_addr = instruction_addr;
+        }
+    }
+    push_instruction(&mut forth.data_space, "BYE");
+}
+
 fn main() {
     let mut forth = ForthMachine::new(
         DataSpace::with_size(1024),
@@ -319,9 +382,9 @@ fn main() {
     );
     forth.data_stack.push(1);
     forth.data_stack.push(2);
-    let instruction = forth.data_space.find_entry("SWAP").map(|entry| entry.definition_addr()).unwrap();
-    forth.instruction_addr = &instruction as *const _ as usize;
-    next(&mut forth);
-    interpret(&mut forth, "DUP");
+    set_instructions(&mut forth, ["SWAP", "DUP"].iter().map(|s| *s));
+    while forth.instruction_addr != 0 {
+        next(&mut forth);
+    }
     println!("{:?}", forth);
 }
