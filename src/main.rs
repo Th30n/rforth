@@ -234,6 +234,7 @@ struct ForthMachine {
     data_space: DataSpace,
     data_stack: Vec<isize>,
     return_stack: Vec<isize>,
+    curr_def_addr: usize,
     instruction_addr: usize,
 }
 
@@ -241,15 +242,61 @@ fn dup_builtin(forth: &mut ForthMachine) {
     forth.data_stack.push(*forth.data_stack.last().unwrap());
 }
 
+fn swap_builtin(forth: &mut ForthMachine) {
+    let a = forth.data_stack.pop().unwrap();
+    let b = forth.data_stack.pop().unwrap();
+    forth.data_stack.push(a);
+    forth.data_stack.push(b);
+}
+
+fn docol_builtin(forth: &mut ForthMachine) {
+    forth.return_stack.push(forth.instruction_addr as isize);
+    forth.instruction_addr = forth.curr_def_addr.checked_add(PTR_SIZE).unwrap();
+}
+
+fn exit_builtin(forth: &mut ForthMachine) {
+    forth.instruction_addr = forth.return_stack.pop().unwrap() as usize;
+}
+
+fn add_builtins(data_space: &mut DataSpace) {
+    data_space.push_builtin_word("DUP", dup_builtin);
+    data_space.push_builtin_word("SWAP", swap_builtin);
+    data_space.push_builtin_word("DOCOL", docol_builtin);
+    data_space.push_builtin_word("EXIT", exit_builtin);
+}
+
+impl ForthMachine {
+    pub fn new(
+        mut data_space: DataSpace,
+        data_stack: Vec<isize>,
+        return_stack: Vec<isize>,
+    ) -> Self {
+        add_builtins(&mut data_space);
+        ForthMachine {
+            data_space: data_space,
+            data_stack: data_stack,
+            return_stack: return_stack,
+            instruction_addr: 0,
+            curr_def_addr: 0,
+        }
+    }
+}
+
+fn exec_fun_indirect(addr: usize, forth: &mut ForthMachine) {
+    // TODO: Check addr & fun_addr actually points to valid code.
+    let fun_addr = unsafe { *(addr as *const usize) };
+    let fun: fn(&mut ForthMachine) = unsafe { std::mem::transmute(fun_addr as *const u8) };
+    return fun(forth);
+}
+
 fn next(forth: &mut ForthMachine) {
     if forth.instruction_addr == 0 {
         return;
     }
-    // TODO: Check code_addr actually points to valid code.
-    let code_addr = unsafe { *(forth.instruction_addr as *const usize) };
-    let code_fun: fn(&mut ForthMachine) = unsafe { std::mem::transmute(code_addr as *const u8) };
-    forth.instruction_addr.checked_add(PTR_SIZE).unwrap();
-    code_fun(forth);
+    let def_addr = unsafe { *(forth.instruction_addr as *const usize) };
+    forth.curr_def_addr = def_addr;
+    forth.instruction_addr = forth.instruction_addr.checked_add(PTR_SIZE).unwrap();
+    exec_fun_indirect(def_addr, forth);
 }
 
 fn interpret(forth: &mut ForthMachine, word: &str) {
@@ -258,31 +305,23 @@ fn interpret(forth: &mut ForthMachine, word: &str) {
         .find_entry(word)
         .map(|entry| entry.definition_addr());
     if let Some(definition_addr) = maybe_definition_addr {
-        forth.instruction_addr = definition_addr;
+        exec_fun_indirect(definition_addr, forth);
     } else {
         forth.instruction_addr = 0;
     }
 }
 
 fn main() {
-    let mut forth = ForthMachine {
-        data_space: DataSpace::with_size(1024),
-        data_stack: Vec::with_capacity(256),
-        return_stack: Vec::with_capacity(256),
-        instruction_addr: 0,
-    };
-    let data_space = &mut forth.data_space;
-    println!("Data space ptr: {:p}", data_space.ptr);
-    println!("Unused data space: {} bytes", data_space.unused());
-    data_space.push_builtin_word("DUP", dup_builtin);
-    let entry1 = data_space.latest_entry().unwrap();
-    println!("Dict entry 1 {:?}", entry1);
-    println!("Unused data space: {} bytes", data_space.unused());
-    data_space.push_dict_entry("SWAP");
-    let entry2 = data_space.latest_entry().unwrap();
-    println!("Dict entry 2 {:?}", entry2);
+    let mut forth = ForthMachine::new(
+        DataSpace::with_size(1024),
+        Vec::with_capacity(256),
+        Vec::with_capacity(256),
+    );
     forth.data_stack.push(1);
-    interpret(&mut forth, "DUP");
+    forth.data_stack.push(2);
+    let instruction = forth.data_space.find_entry("SWAP").map(|entry| entry.definition_addr()).unwrap();
+    forth.instruction_addr = &instruction as *const _ as usize;
     next(&mut forth);
+    interpret(&mut forth, "DUP");
     println!("{:?}", forth);
 }
