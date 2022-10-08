@@ -40,8 +40,8 @@ impl Memory {
             }
         }
         Memory {
-            layout: layout,
-            ptr: ptr,
+            layout,
+            ptr,
             current: ptr,
         }
     }
@@ -72,7 +72,7 @@ impl Memory {
         true
     }
 
-    pub fn alloc<'a>(&'a mut self, bytes: usize) -> Option<&'a mut [u8]> {
+    pub fn alloc(&mut self, bytes: usize) -> Option<&mut [u8]> {
         if bytes > self.unused() {
             None
         } else {
@@ -199,7 +199,7 @@ impl DataSpace {
         DataSpace {
             memory: Memory::with_size(bytes),
             dict_head: std::ptr::null(),
-            builtin_addrs: builtin_addrs,
+            builtin_addrs,
         }
     }
 
@@ -225,7 +225,7 @@ impl DataSpace {
         self.memory.align()
     }
 
-    pub fn alloc<'a>(&'a mut self, bytes: usize) -> Option<&'a mut [u8]> {
+    pub fn alloc(&mut self, bytes: usize) -> Option<&mut [u8]> {
         self.memory.alloc(bytes)
     }
 
@@ -262,13 +262,13 @@ impl DataSpace {
         }
     }
 
-    pub fn latest_entry<'a>(&'a self) -> Option<DictEntryRef<'a>> {
+    pub fn latest_entry(&self) -> Option<DictEntryRef<'_>> {
         let maybe_entry = unsafe { self.dict_head.as_ref() };
         maybe_entry.map(|ptr| {
             assert!(self.is_valid_ptr(ptr as *const u8));
             DictEntryRef {
                 data_space: self,
-                ptr: ptr,
+                ptr,
             }
         })
     }
@@ -386,9 +386,9 @@ impl ForthMachine {
     ) -> Self {
         add_builtins(&mut data_space);
         ForthMachine {
-            data_space: data_space,
-            data_stack: data_stack,
-            return_stack: return_stack,
+            data_space,
+            data_stack,
+            return_stack,
             instruction_addr: 0,
             curr_def_addr: 0,
         }
@@ -400,7 +400,7 @@ fn exec_fun_indirect(addr: usize, forth: &mut ForthMachine) {
     let fun_addr = unsafe { *(addr as *const usize) };
     assert!(forth.data_space.is_builtin_addr(fun_addr));
     let fun: fn(&mut ForthMachine) = unsafe { std::mem::transmute(fun_addr as *const u8) };
-    return fun(forth);
+    fun(forth)
 }
 
 fn next(forth: &mut ForthMachine) {
@@ -445,7 +445,7 @@ fn push_instruction(data_space: &mut DataSpace, def_addr: usize) -> usize {
 
 fn push_word<'a, I>(data_space: &mut DataSpace, name: &str, words: I)
 where
-    I: Iterator<Item = &'a str>,
+    I: IntoIterator<Item = &'a str>,
 {
     assert!(data_space.push_dict_entry(name));
     push_instruction(data_space, docol as usize);
@@ -459,7 +459,7 @@ where
 
 fn set_instructions<'a, I>(forth: &mut ForthMachine, words: I)
 where
-    I: Iterator<Item = &'a str>,
+    I: IntoIterator<Item = &'a str>,
 {
     assert!(forth.data_space.align());
     for word in words {
@@ -481,12 +481,8 @@ fn main() {
     );
     forth.data_stack.push(1);
     forth.data_stack.push(2);
-    push_word(
-        &mut forth.data_space,
-        "GO",
-        ["SWAP", "DUP"].iter().map(|s| *s),
-    );
-    set_instructions(&mut forth, ["GO"].iter().map(|s| *s));
+    push_word(&mut forth.data_space, "GO", ["SWAP", "DUP"]);
+    set_instructions(&mut forth, ["GO"]);
     while forth.instruction_addr != 0 {
         next(&mut forth);
     }
