@@ -1,5 +1,5 @@
 use std::convert::TryFrom;
-use std::io::Write;
+use std::io::{Read, Write};
 
 const PTR_SIZE: usize = std::mem::size_of::<usize>();
 
@@ -338,6 +338,9 @@ fn test_data_space_find_entry() {
     }
 }
 
+const INPUT_BUFFER_SIZE: usize = 4096;
+const WORD_BUFFER_SIZE: usize = 32;
+
 #[derive(Debug)]
 struct ForthMachine {
     data_space: DataSpace,
@@ -345,6 +348,33 @@ struct ForthMachine {
     return_stack: Vec<isize>,
     curr_def_addr: usize,
     instruction_addr: usize,
+    // Input bufer and vars for KEY word.
+    input_buffer: [u8; INPUT_BUFFER_SIZE],
+    curr_input_ix: usize,
+    curr_input_len: usize,
+    // Buffer for WORD word.
+    word_buffer: [u8; WORD_BUFFER_SIZE],
+}
+
+impl ForthMachine {
+    pub fn new(
+        mut data_space: DataSpace,
+        data_stack: Vec<isize>,
+        return_stack: Vec<isize>,
+    ) -> Self {
+        add_builtins(&mut data_space);
+        Self {
+            data_space,
+            data_stack,
+            return_stack,
+            instruction_addr: 0,
+            curr_def_addr: 0,
+            input_buffer: [0; INPUT_BUFFER_SIZE],
+            curr_input_ix: 0,
+            curr_input_len: 0,
+            word_buffer: [0; WORD_BUFFER_SIZE],
+        }
+    }
 }
 
 fn bye_builtin(forth: &mut ForthMachine) {
@@ -371,28 +401,69 @@ fn exit_builtin(forth: &mut ForthMachine) {
     forth.instruction_addr = forth.return_stack.pop().unwrap() as usize;
 }
 
+fn read_stdin_byte(forth: &mut ForthMachine) -> std::io::Result<u8> {
+    if forth.curr_input_ix == forth.curr_input_len {
+        let num_read = std::io::stdin().read(&mut forth.input_buffer)?;
+        // Handle EOF
+        if num_read == 0 {
+            // TODO: Exit the ForthMachine instead.
+            std::process::exit(0);
+        }
+        forth.curr_input_len = num_read;
+        forth.curr_input_ix = 0;
+    }
+    assert!(forth.curr_input_ix < forth.curr_input_len);
+    assert!(forth.curr_input_len <= forth.input_buffer.len());
+    let byte = forth.input_buffer[forth.curr_input_ix];
+    forth.curr_input_ix += 1;
+    Ok(byte)
+}
+
+fn key_builtin(forth: &mut ForthMachine) {
+    let byte = read_stdin_byte(forth).unwrap();
+    forth.data_stack.push(byte as isize);
+}
+
+fn emit_builtin(forth: &mut ForthMachine) {
+    let v = forth.data_stack.pop().unwrap() as u8;
+    assert_eq!(std::io::stdout().write(&[v]).unwrap(), 1);
+}
+
+const BLANK_CHARS: [char; 3] = [' ', '\t', '\n'];
+
+fn word_builtin(forth: &mut ForthMachine) {
+    let mut byte = read_stdin_byte(forth).unwrap();
+    // Skip comment until newline
+    if byte == b'\\' {
+        while byte != b'\n' {
+            byte = read_stdin_byte(forth).unwrap();
+        }
+    }
+    // Skip blanks
+    while BLANK_CHARS.contains(&byte.into()) {
+        byte = read_stdin_byte(forth).unwrap();
+    }
+    let mut word_buffer_ix = 0;
+    while !BLANK_CHARS.contains(&byte.into()) {
+        assert!(word_buffer_ix < WORD_BUFFER_SIZE);
+        forth.word_buffer[word_buffer_ix] = byte;
+        byte = read_stdin_byte(forth).unwrap();
+        word_buffer_ix += 1;
+    }
+    forth
+        .data_stack
+        .push(&forth.word_buffer as *const u8 as isize);
+    forth.data_stack.push(word_buffer_ix as isize); // len
+}
+
 fn add_builtins(data_space: &mut DataSpace) {
     data_space.push_builtin_word("BYE", bye_builtin);
     data_space.push_builtin_word("DUP", dup_builtin);
     data_space.push_builtin_word("SWAP", swap_builtin);
     data_space.push_builtin_word("EXIT", exit_builtin);
-}
-
-impl ForthMachine {
-    pub fn new(
-        mut data_space: DataSpace,
-        data_stack: Vec<isize>,
-        return_stack: Vec<isize>,
-    ) -> Self {
-        add_builtins(&mut data_space);
-        ForthMachine {
-            data_space,
-            data_stack,
-            return_stack,
-            instruction_addr: 0,
-            curr_def_addr: 0,
-        }
-    }
+    data_space.push_builtin_word("KEY", key_builtin);
+    data_space.push_builtin_word("EMIT", emit_builtin);
+    data_space.push_builtin_word("WORD", word_builtin);
 }
 
 fn exec_fun_indirect(addr: usize, forth: &mut ForthMachine) {
@@ -481,10 +552,10 @@ fn main() {
     );
     forth.data_stack.push(1);
     forth.data_stack.push(2);
-    push_word(&mut forth.data_space, "GO", ["SWAP", "DUP"]);
+    push_word(&mut forth.data_space, "GO", ["KEY", "EMIT", "WORD"]);
     set_instructions(&mut forth, ["GO"]);
     while forth.instruction_addr != 0 {
         next(&mut forth);
     }
-    println!("{:?}", forth);
+    println!("\nforth.data_stack: {:?}", forth.data_stack);
 }
