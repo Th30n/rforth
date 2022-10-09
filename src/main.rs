@@ -23,7 +23,7 @@ fn is_within<T: Ord>(val: &T, lower: &T, upper: &T) -> bool {
 
 /// Raw memory buffer with stack based allocation scheme.
 #[derive(Debug)]
-struct Memory {
+pub struct Memory {
     layout: std::alloc::Layout,
     ptr: *mut u8,
     current: *mut u8,
@@ -31,6 +31,7 @@ struct Memory {
 
 impl Memory {
     pub fn with_size(bytes: usize) -> Self {
+        assert!(bytes > 0);
         let layout = std::alloc::Layout::from_size_align(bytes, 8).unwrap();
         let ptr;
         unsafe {
@@ -273,7 +274,7 @@ impl DataSpace {
         })
     }
 
-    pub fn find_entry<'a>(&'a self, name: &str) -> Option<DictEntryRef<'a>> {
+    pub fn find_entry(&self, name: &str) -> Option<DictEntryRef<'_>> {
         let mut maybe_entry = self.latest_entry();
         while let Some(entry) = maybe_entry {
             if entry.name() == name {
