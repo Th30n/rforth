@@ -408,13 +408,13 @@ fn exit_builtin(forth: &mut ForthMachine) {
     forth.instruction_addr = forth.return_stack.pop().unwrap() as usize;
 }
 
-fn read_stdin_byte(forth: &mut ForthMachine) -> std::io::Result<u8> {
+// Return Ok(None) on EOF.
+fn read_stdin_byte(forth: &mut ForthMachine) -> std::io::Result<Option<u8>> {
     if forth.curr_input_ix == forth.curr_input_len {
         let num_read = std::io::stdin().read(&mut forth.input_buffer)?;
         // Handle EOF
         if num_read == 0 {
-            // TODO: Exit the ForthMachine instead.
-            std::process::exit(0);
+            return Ok(None);
         }
         forth.curr_input_len = num_read;
         forth.curr_input_ix = 0;
@@ -423,12 +423,15 @@ fn read_stdin_byte(forth: &mut ForthMachine) -> std::io::Result<u8> {
     assert!(forth.curr_input_len <= forth.input_buffer.len());
     let byte = forth.input_buffer[forth.curr_input_ix];
     forth.curr_input_ix += 1;
-    Ok(byte)
+    Ok(Some(byte))
 }
 
 fn key_builtin(forth: &mut ForthMachine) {
-    let byte = read_stdin_byte(forth).unwrap();
-    forth.data_stack.push(byte as isize);
+    if let Some(byte) = read_stdin_byte(forth).unwrap() {
+        forth.data_stack.push(byte as isize)
+    } else {
+        bye_builtin(forth)
+    }
 }
 
 fn emit_builtin(forth: &mut ForthMachine) {
@@ -439,26 +442,34 @@ fn emit_builtin(forth: &mut ForthMachine) {
 const BLANK_CHARS: [char; 3] = [' ', '\t', '\n'];
 
 fn word_builtin(forth: &mut ForthMachine) {
-    let mut byte = read_stdin_byte(forth).unwrap();
-    // Skip comment until newline
-    if byte == b'\\' {
-        while byte != b'\n' {
-            byte = read_stdin_byte(forth).unwrap();
+    // Wrap code into a function, so we can more easily return None on EOF,
+    // which exits the ForthMachine;
+    let do_word_builtin = |forth: &mut ForthMachine| -> Option<()> {
+        let mut byte = read_stdin_byte(forth).unwrap()?;
+        // Skip comment until newline
+        if byte == b'\\' {
+            while byte != b'\n' {
+                byte = read_stdin_byte(forth).unwrap()?;
+            }
         }
+        // Skip blanks
+        while BLANK_CHARS.contains(&byte.into()) {
+            byte = read_stdin_byte(forth).unwrap()?;
+        }
+        let mut word_buffer_ix = 0;
+        while !BLANK_CHARS.contains(&byte.into()) {
+            assert!(word_buffer_ix < WORD_BUFFER_SIZE);
+            forth.word_buffer()[word_buffer_ix] = byte;
+            byte = read_stdin_byte(forth).unwrap()?;
+            word_buffer_ix += 1;
+        }
+        forth.data_stack.push(forth.word_buffer_ptr as isize);
+        forth.data_stack.push(word_buffer_ix as isize); // len
+        Some(())
+    };
+    if do_word_builtin(forth).is_none() {
+        bye_builtin(forth)
     }
-    // Skip blanks
-    while BLANK_CHARS.contains(&byte.into()) {
-        byte = read_stdin_byte(forth).unwrap();
-    }
-    let mut word_buffer_ix = 0;
-    while !BLANK_CHARS.contains(&byte.into()) {
-        assert!(word_buffer_ix < WORD_BUFFER_SIZE);
-        forth.word_buffer()[word_buffer_ix] = byte;
-        byte = read_stdin_byte(forth).unwrap();
-        word_buffer_ix += 1;
-    }
-    forth.data_stack.push(forth.word_buffer_ptr as isize);
-    forth.data_stack.push(word_buffer_ix as isize); // len
 }
 
 fn add_builtins(data_space: &mut DataSpace) {
@@ -555,6 +566,7 @@ fn main() {
         Vec::with_capacity(256),
         Vec::with_capacity(256),
     );
+    println!("Welcome to rForth");
     forth.data_stack.push(1);
     forth.data_stack.push(2);
     push_word(&mut forth.data_space, "GO", ["KEY", "EMIT", "WORD"]);
