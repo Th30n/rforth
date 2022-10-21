@@ -388,6 +388,10 @@ fn bye_builtin(forth: &mut ForthMachine) {
     forth.instruction_addr = 0;
 }
 
+fn drop_builtin(forth: &mut ForthMachine) {
+    forth.data_stack.pop().unwrap();
+}
+
 fn dup_builtin(forth: &mut ForthMachine) {
     forth.data_stack.push(*forth.data_stack.last().unwrap());
 }
@@ -472,14 +476,32 @@ fn word_builtin(forth: &mut ForthMachine) {
     }
 }
 
+fn store_builtin(forth: &mut ForthMachine) {
+    let ptr = forth.data_stack.pop().unwrap() as *mut isize;
+    assert!(forth.data_space.is_valid_ptr(ptr));
+    let val = forth.data_stack.pop().unwrap();
+    let addr_ref = unsafe { ptr.as_mut().unwrap() };
+    *addr_ref = val
+}
+
+fn fetch_builtin(forth: &mut ForthMachine) {
+    let ptr = forth.data_stack.pop().unwrap() as *const isize;
+    assert!(forth.data_space.is_valid_ptr(ptr));
+    let addr_ref = unsafe { ptr.as_ref().unwrap() };
+    forth.data_stack.push(*addr_ref)
+}
+
 fn add_builtins(data_space: &mut DataSpace) {
     data_space.push_builtin_word("BYE", bye_builtin);
+    data_space.push_builtin_word("DROP", drop_builtin);
     data_space.push_builtin_word("DUP", dup_builtin);
     data_space.push_builtin_word("SWAP", swap_builtin);
     data_space.push_builtin_word("EXIT", exit_builtin);
     data_space.push_builtin_word("KEY", key_builtin);
     data_space.push_builtin_word("EMIT", emit_builtin);
     data_space.push_builtin_word("WORD", word_builtin);
+    data_space.push_builtin_word("!", store_builtin);
+    data_space.push_builtin_word("@", fetch_builtin);
 }
 
 fn exec_fun_indirect(addr: usize, forth: &mut ForthMachine) {
@@ -567,9 +589,11 @@ fn main() {
         Vec::with_capacity(256),
     );
     println!("Welcome to rForth");
-    forth.data_stack.push(1);
-    forth.data_stack.push(2);
-    push_word(&mut forth.data_space, "GO", ["KEY", "EMIT", "WORD"]);
+    push_word(
+        &mut forth.data_space,
+        "GO",
+        ["KEY", "EMIT", "WORD", "SWAP", "@", "EMIT"],
+    );
     set_instructions(&mut forth, ["GO"]);
     while forth.instruction_addr != 0 {
         next(&mut forth);
