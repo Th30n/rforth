@@ -353,8 +353,8 @@ struct ForthMachine {
     input_buffer: [u8; INPUT_BUFFER_SIZE],
     curr_input_ix: usize,
     curr_input_len: usize,
-    // Buffer for WORD word.
-    word_buffer: [u8; WORD_BUFFER_SIZE],
+    // Buffer inside `data_space` for WORD word; length is WORD_BUFFER_SIZE
+    word_buffer_ptr: *mut u8,
 }
 
 impl ForthMachine {
@@ -363,6 +363,8 @@ impl ForthMachine {
         data_stack: Vec<isize>,
         return_stack: Vec<isize>,
     ) -> Self {
+        let word_buffer_ptr = data_space.alloc(WORD_BUFFER_SIZE).unwrap().as_mut_ptr();
+        assert!(data_space.align());
         add_builtins(&mut data_space);
         Self {
             data_space,
@@ -373,8 +375,12 @@ impl ForthMachine {
             input_buffer: [0; INPUT_BUFFER_SIZE],
             curr_input_ix: 0,
             curr_input_len: 0,
-            word_buffer: [0; WORD_BUFFER_SIZE],
+            word_buffer_ptr,
         }
+    }
+
+    fn word_buffer(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.word_buffer_ptr, WORD_BUFFER_SIZE) }
     }
 }
 
@@ -447,13 +453,11 @@ fn word_builtin(forth: &mut ForthMachine) {
     let mut word_buffer_ix = 0;
     while !BLANK_CHARS.contains(&byte.into()) {
         assert!(word_buffer_ix < WORD_BUFFER_SIZE);
-        forth.word_buffer[word_buffer_ix] = byte;
+        forth.word_buffer()[word_buffer_ix] = byte;
         byte = read_stdin_byte(forth).unwrap();
         word_buffer_ix += 1;
     }
-    forth
-        .data_stack
-        .push(&forth.word_buffer as *const u8 as isize);
+    forth.data_stack.push(forth.word_buffer_ptr as isize);
     forth.data_stack.push(word_buffer_ix as isize); // len
 }
 
