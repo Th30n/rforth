@@ -551,6 +551,22 @@ fn to_cfa_builtin(forth: &mut ForthMachine) {
         .push(dict_entry_ref.definition_addr() as isize);
 }
 
+fn branch_builtin(forth: &mut ForthMachine) {
+    let ptr_to_offset = forth.instruction_addr as *const usize;
+    assert!(forth.data_space.is_valid_ptr(ptr_to_offset));
+    let offset = unsafe { *ptr_to_offset };
+    forth.instruction_addr.checked_add(offset).unwrap();
+}
+
+fn zbranch_builtin(forth: &mut ForthMachine) {
+    let val = forth.data_stack.pop().unwrap();
+    if val == 0 {
+        branch_builtin(forth);
+    } else {
+        forth.instruction_addr = forth.instruction_addr.checked_add(PTR_SIZE).unwrap();
+    }
+}
+
 fn add_builtins(data_space: &mut DataSpace) {
     data_space.push_builtin_word("BYE", bye_builtin);
     data_space.push_builtin_word("DROP", drop_builtin);
@@ -565,6 +581,8 @@ fn add_builtins(data_space: &mut DataSpace) {
     data_space.push_builtin_word("S>NUMBER?", number_builtin);
     data_space.push_builtin_word("FIND", find_builtin);
     data_space.push_builtin_word(">CFA", to_cfa_builtin);
+    data_space.push_builtin_word("BRANCH", branch_builtin);
+    data_space.push_builtin_word("0BRANCH", zbranch_builtin);
 }
 
 fn exec_fun_indirect(addr: usize, forth: &mut ForthMachine) {
