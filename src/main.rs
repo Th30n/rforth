@@ -449,8 +449,6 @@ fn emit_builtin(forth: &mut ForthMachine) {
 const BLANK_CHARS: [char; 3] = [' ', '\t', '\n'];
 
 fn word_builtin(forth: &mut ForthMachine) {
-    // Wrap code into a function, so we can more easily return None on EOF,
-    // which exits the ForthMachine;
     let do_word_builtin = |forth: &mut ForthMachine| -> Option<()> {
         let mut byte = read_stdin_byte(forth).unwrap()?;
         // Skip comment until newline
@@ -521,6 +519,38 @@ fn number_builtin(forth: &mut ForthMachine) {
     }
 }
 
+// Return name token (start of dict entry) or 0.
+// (addr u - nt | 0)
+fn find_builtin(forth: &mut ForthMachine) {
+    let byte_len = forth.data_stack.pop().unwrap() as usize;
+    let ptr = forth.data_stack.pop().unwrap() as *const u8;
+    assert!(forth.data_space.is_valid_ptr(ptr));
+    assert!(forth
+        .data_space
+        .is_valid_ptr((ptr as usize + byte_len - 1) as *const u8));
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
+    let name = std::str::from_utf8(bytes).unwrap();
+    match forth.data_space.find_entry(name) {
+        None => forth.data_stack.push(0),
+        Some(dict_entry_ref) => forth
+            .data_stack
+            .push(dict_entry_ref.ptr as *const u8 as isize),
+    }
+}
+
+// Return Code Field Address (i.e. definition address of a dict entry).
+fn to_cfa_builtin(forth: &mut ForthMachine) {
+    let ptr = forth.data_stack.pop().unwrap() as *const u8;
+    let ptr = unsafe { ptr.as_ref() }.unwrap();
+    let dict_entry_ref = DictEntryRef {
+        data_space: &forth.data_space,
+        ptr,
+    };
+    forth
+        .data_stack
+        .push(dict_entry_ref.definition_addr() as isize);
+}
+
 fn add_builtins(data_space: &mut DataSpace) {
     data_space.push_builtin_word("BYE", bye_builtin);
     data_space.push_builtin_word("DROP", drop_builtin);
@@ -533,6 +563,8 @@ fn add_builtins(data_space: &mut DataSpace) {
     data_space.push_builtin_word("!", store_builtin);
     data_space.push_builtin_word("@", fetch_builtin);
     data_space.push_builtin_word("S>NUMBER?", number_builtin);
+    data_space.push_builtin_word("FIND", find_builtin);
+    data_space.push_builtin_word(">CFA", to_cfa_builtin);
 }
 
 fn exec_fun_indirect(addr: usize, forth: &mut ForthMachine) {
@@ -554,18 +586,6 @@ fn next(forth: &mut ForthMachine) {
     forth.curr_def_addr = def_addr;
     forth.instruction_addr = forth.instruction_addr.checked_add(PTR_SIZE).unwrap();
     exec_fun_indirect(def_addr, forth);
-}
-
-fn interpret(forth: &mut ForthMachine, word: &str) {
-    let maybe_definition_addr = forth
-        .data_space
-        .find_entry(word)
-        .map(|entry| entry.definition_addr());
-    if let Some(definition_addr) = maybe_definition_addr {
-        exec_fun_indirect(definition_addr, forth);
-    } else {
-        forth.instruction_addr = 0;
-    }
 }
 
 fn compile_word(data_space: &mut DataSpace, word: &str) -> usize {
@@ -683,6 +703,7 @@ fn main() {
         Vec::with_capacity(cli_args.data_stack_size),
         Vec::with_capacity(cli_args.return_stack_size),
     );
+    push_word(&mut forth.data_space, "INTERPRET", ["WORD", "FIND"]);
     push_word(
         &mut forth.data_space,
         "GO",
