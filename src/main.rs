@@ -567,6 +567,14 @@ fn zbranch_builtin(forth: &mut ForthMachine) {
     }
 }
 
+fn lit_builtin(forth: &mut ForthMachine) {
+    let ptr_to_val = forth.instruction_addr as *const usize;
+    assert!(forth.data_space.is_valid_ptr(ptr_to_val));
+    let val = unsafe { *ptr_to_val };
+    forth.instruction_addr = forth.instruction_addr.checked_add(PTR_SIZE).unwrap();
+    forth.data_stack.push(val as isize);
+}
+
 fn add_builtins(data_space: &mut DataSpace) {
     data_space.push_builtin_word("BYE", bye_builtin);
     data_space.push_builtin_word("DROP", drop_builtin);
@@ -583,10 +591,15 @@ fn add_builtins(data_space: &mut DataSpace) {
     data_space.push_builtin_word(">CFA", to_cfa_builtin);
     data_space.push_builtin_word("BRANCH", branch_builtin);
     data_space.push_builtin_word("0BRANCH", zbranch_builtin);
+    data_space.push_builtin_word("LIT", lit_builtin);
 }
 
 fn exec_fun_indirect(addr: usize, forth: &mut ForthMachine) {
-    assert!(forth.data_space.is_valid_ptr(addr as *const usize));
+    assert!(
+        forth.data_space.is_valid_ptr(addr as *const usize),
+        "'{addr:#x} ({addr})' is not a valid ptr",
+        addr = addr,
+    );
     let fun_addr = unsafe { *(addr as *const usize) };
     assert!(forth.data_space.is_builtin_addr(fun_addr));
     let fun: fn(&mut ForthMachine) = unsafe { std::mem::transmute(fun_addr as *const u8) };
@@ -606,13 +619,6 @@ fn next(forth: &mut ForthMachine) {
     exec_fun_indirect(def_addr, forth);
 }
 
-fn compile_word(data_space: &mut DataSpace, word: &str) -> usize {
-    data_space
-        .find_entry(word)
-        .map(|entry| entry.definition_addr())
-        .unwrap()
-}
-
 fn push_instruction(data_space: &mut DataSpace, def_addr: usize) -> usize {
     assert!(is_aligned(data_space.memory.current as usize, PTR_SIZE));
     let instruction_buf = data_space.alloc(PTR_SIZE).unwrap();
@@ -628,10 +634,19 @@ where
     assert!(data_space.push_dict_entry(name));
     push_instruction(data_space, docol as usize);
     for word in words {
-        let def_addr = compile_word(data_space, word);
-        push_instruction(data_space, def_addr);
+        match data_space.find_entry(word) {
+            Some(entry) => push_instruction(data_space, entry.definition_addr()),
+            None => {
+                let num: isize = word.parse().unwrap();
+                push_instruction(
+                    data_space,
+                    data_space.find_entry("LIT").unwrap().definition_addr(),
+                );
+                push_instruction(data_space, num as usize)
+            }
+        };
     }
-    let def_addr = compile_word(data_space, "EXIT");
+    let def_addr = data_space.find_entry("EXIT").unwrap().definition_addr();
     push_instruction(data_space, def_addr);
 }
 
@@ -641,13 +656,17 @@ where
 {
     assert!(forth.data_space.align());
     for word in words {
-        let def_addr = compile_word(&mut forth.data_space, word);
+        let def_addr = forth.data_space.find_entry(word).unwrap().definition_addr();
         let instruction_addr = push_instruction(&mut forth.data_space, def_addr);
         if forth.instruction_addr == 0 {
             forth.instruction_addr = instruction_addr;
         }
     }
-    let def_addr = compile_word(&mut forth.data_space, "BYE");
+    let def_addr = forth
+        .data_space
+        .find_entry("BYE")
+        .unwrap()
+        .definition_addr();
     push_instruction(&mut forth.data_space, def_addr);
 }
 
@@ -721,11 +740,15 @@ fn main() {
         Vec::with_capacity(cli_args.data_stack_size),
         Vec::with_capacity(cli_args.return_stack_size),
     );
-    push_word(&mut forth.data_space, "INTERPRET", ["WORD", "FIND"]);
+    push_word(
+        &mut forth.data_space,
+        "INTERPRET",
+        ["WORD", "FIND", "DUP", "0BRANCH", "8", "BYE", "BYE"],
+    );
     push_word(
         &mut forth.data_space,
         "GO",
-        ["KEY", "EMIT", "WORD", "S>NUMBER?"],
+        ["KEY", "EMIT", "WORD", "S>NUMBER?", "42", "DUP"],
     );
     set_instructions(&mut forth, ["GO"]);
     while forth.instruction_addr != 0 {
@@ -733,4 +756,5 @@ fn main() {
     }
     println!("\nBye!");
     dbg!(forth.data_stack);
+    dbg!(forth.return_stack);
 }
