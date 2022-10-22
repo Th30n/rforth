@@ -125,7 +125,15 @@ fn test_memory_align() {
     assert_eq!(memory.unused(), 1024 - 16 - 8);
 }
 
+enum WordFlag {
+    Hidden = 0x20,
+    Immediate = 0x80,
+}
+
 /// Entry in a Forth dictionary
+///
+/// Memory layout of a dict entry is the following.
+/// | prev: ptr | flags: usize | len: usize | name: bytes | padding | definition...
 #[derive(Copy, Clone)]
 struct DictEntryRef<'a> {
     data_space: &'a DataSpace,
@@ -138,6 +146,12 @@ impl<'a> DictEntryRef<'a> {
         let ptr = self.ptr as *const u8;
         assert!(self.data_space.is_valid_ptr(ptr));
         unsafe { std::slice::from_raw_parts(ptr, self.data_space.end() - ptr as usize) }
+    }
+
+    fn ptr_as_slice_mut(&mut self) -> &mut [u8] {
+        let ptr = self.ptr as *const u8 as *mut u8;
+        assert!(self.data_space.is_valid_ptr(ptr));
+        unsafe { std::slice::from_raw_parts_mut(ptr, self.data_space.end() - ptr as usize) }
     }
 
     pub fn prev(&self) -> Option<DictEntryRef<'a>> {
@@ -158,8 +172,19 @@ impl<'a> DictEntryRef<'a> {
         }
     }
 
+    pub fn flags(&self) -> usize {
+        let flags_buf = &self.ptr_as_slice()[PTR_SIZE..][..PTR_SIZE];
+        usize::from_ne_bytes(<[u8; PTR_SIZE]>::try_from(flags_buf).unwrap())
+    }
+
+    pub fn set_flags(&mut self, flags: usize) {
+        let flags_buf = &mut self.ptr_as_slice_mut()[PTR_SIZE..][..PTR_SIZE];
+        let mut cursor = std::io::Cursor::new(flags_buf);
+        cursor.write_all(&flags.to_ne_bytes()).unwrap();
+    }
+
     pub fn name(&self) -> &str {
-        let (len_buf, name_buf) = self.ptr_as_slice()[PTR_SIZE..].split_at(PTR_SIZE);
+        let (len_buf, name_buf) = self.ptr_as_slice()[2 * PTR_SIZE..].split_at(PTR_SIZE);
         let len = usize::from_ne_bytes(<[u8; PTR_SIZE]>::try_from(len_buf).unwrap());
         std::str::from_utf8(&name_buf[0..len]).unwrap()
     }
@@ -168,6 +193,20 @@ impl<'a> DictEntryRef<'a> {
         let addr = align_addr(self.name().as_ptr() as usize + self.name().len());
         assert!(self.data_space.is_valid_ptr(addr as *const usize));
         addr
+    }
+
+    // Return true if now hidden.
+    pub fn toggle_hidden(&mut self) -> bool {
+        let new_flags = self.flags() ^ WordFlag::Hidden as usize;
+        self.set_flags(new_flags);
+        (new_flags & WordFlag::Hidden as usize) != 0
+    }
+
+    // Return true if now immediate.
+    pub fn toggle_immediate(&mut self) -> bool {
+        let new_flags = self.flags() ^ WordFlag::Immediate as usize;
+        self.set_flags(new_flags);
+        (new_flags & WordFlag::Immediate as usize) != 0
     }
 }
 
@@ -196,8 +235,7 @@ struct DataSpace {
 
 impl DataSpace {
     pub fn with_size(bytes: usize) -> Self {
-        let mut builtin_addrs = Vec::with_capacity(64);
-        builtin_addrs.push(docol as usize);
+        let builtin_addrs = Vec::with_capacity(64);
         DataSpace {
             memory: Memory::with_size(bytes),
             dict_head: std::ptr::null(),
@@ -242,14 +280,15 @@ impl DataSpace {
     /// Allocate a new entry in the dictionary with given `name`.
     /// The entry is padded, so that the next allocation is aligned.
     #[must_use]
-    pub fn push_dict_entry(&mut self, name: &str) -> bool {
+    pub fn push_dict_entry(&mut self, name: &str, flags: usize) -> bool {
         let prev_addr = self.dict_head as usize;
-        let entry_size = PTR_SIZE + PTR_SIZE + name.len();
+        let entry_size = PTR_SIZE + PTR_SIZE + PTR_SIZE + name.len();
         match self.alloc(entry_size) {
             None => false,
             Some(buf) => {
                 let mut cursor = std::io::Cursor::new(buf);
                 cursor.write_all(&prev_addr.to_ne_bytes()).unwrap();
+                cursor.write_all(&flags.to_ne_bytes()).unwrap();
                 cursor.write_all(&name.len().to_ne_bytes()).unwrap();
                 cursor.write_all(name.as_bytes()).unwrap();
                 let entry_ptr = cursor.into_inner().as_ptr();
@@ -291,8 +330,8 @@ impl DataSpace {
         self.builtin_addrs.contains(&addr)
     }
 
-    pub fn push_builtin_word(&mut self, name: &str, word_fn: fn(&mut ForthMachine)) {
-        assert!(self.push_dict_entry(name));
+    pub fn push_builtin_word(&mut self, name: &str, flags: usize, word_fn: fn(&mut ForthMachine)) {
+        assert!(self.push_dict_entry(name, flags));
         {
             let fn_addr = word_fn as usize;
             if !self.is_builtin_addr(fn_addr) {
@@ -345,6 +384,12 @@ const FORTH_FALSE: isize = 0;
 const INPUT_BUFFER_SIZE: usize = 4096;
 const WORD_BUFFER_SIZE: usize = 32;
 
+#[derive(Copy, Clone, Debug)]
+enum ForthState {
+    Immediate = 0,
+    Compile = 1,
+}
+
 #[derive(Debug)]
 struct ForthMachine {
     data_space: DataSpace,
@@ -358,6 +403,8 @@ struct ForthMachine {
     curr_input_len: usize,
     // Buffer inside `data_space` for WORD word; length is WORD_BUFFER_SIZE
     word_buffer_ptr: *mut u8,
+    // TODO: Move state to DataSpace
+    state: ForthState,
 }
 
 impl ForthMachine {
@@ -379,6 +426,7 @@ impl ForthMachine {
             curr_input_ix: 0,
             curr_input_len: 0,
             word_buffer_ptr,
+            state: ForthState::Immediate,
         }
     }
 
@@ -406,7 +454,7 @@ fn swap_builtin(forth: &mut ForthMachine) {
     forth.data_stack.push(b);
 }
 
-fn docol(forth: &mut ForthMachine) {
+fn docol_builtin(forth: &mut ForthMachine) {
     forth.return_stack.push(forth.instruction_addr as isize);
     forth.instruction_addr = forth.curr_def_addr.checked_add(PTR_SIZE).unwrap();
 }
@@ -538,6 +586,10 @@ fn find_builtin(forth: &mut ForthMachine) {
     }
 }
 
+fn latest_builtin(forth: &mut ForthMachine) {
+    forth.data_stack.push(forth.data_space.dict_head as isize)
+}
+
 // Return Code Field Address (i.e. definition address of a dict entry).
 fn to_cfa_builtin(forth: &mut ForthMachine) {
     let ptr = forth.data_stack.pop().unwrap() as *const u8;
@@ -549,6 +601,26 @@ fn to_cfa_builtin(forth: &mut ForthMachine) {
     forth
         .data_stack
         .push(dict_entry_ref.definition_addr() as isize);
+}
+
+fn hidden_builtin(forth: &mut ForthMachine) {
+    let ptr = forth.data_stack.pop().unwrap() as *const u8;
+    let ptr = unsafe { ptr.as_ref() }.unwrap();
+    let mut dict_entry_ref = DictEntryRef {
+        data_space: &forth.data_space,
+        ptr,
+    };
+    dict_entry_ref.toggle_hidden();
+}
+
+fn immediate_builtin(forth: &mut ForthMachine) {
+    let ptr = forth.data_stack.pop().unwrap() as *const u8;
+    let ptr = unsafe { ptr.as_ref() }.unwrap();
+    let mut dict_entry_ref = DictEntryRef {
+        data_space: &forth.data_space,
+        ptr,
+    };
+    dict_entry_ref.toggle_immediate();
 }
 
 fn branch_builtin(forth: &mut ForthMachine) {
@@ -575,23 +647,56 @@ fn lit_builtin(forth: &mut ForthMachine) {
     forth.data_stack.push(val as isize);
 }
 
+fn create_builtin(forth: &mut ForthMachine) {
+    let byte_len = forth.data_stack.pop().unwrap() as usize;
+    let ptr = forth.data_stack.pop().unwrap() as *const u8;
+    assert!(forth.data_space.is_valid_ptr(ptr));
+    assert!(forth
+        .data_space
+        .is_valid_ptr((ptr as usize + byte_len - 1) as *const u8));
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
+    let name = std::str::from_utf8(bytes).unwrap();
+    assert!(forth.data_space.push_dict_entry(name, 0));
+}
+
+fn comma_builtin(forth: &mut ForthMachine) {
+    let def_addr = forth.data_stack.pop().unwrap();
+    push_instruction(&mut forth.data_space, def_addr as usize);
+}
+
+fn lbrac_builtin(forth: &mut ForthMachine) {
+    forth.state = ForthState::Immediate;
+}
+
+fn rbrac_builtin(forth: &mut ForthMachine) {
+    forth.state = ForthState::Compile;
+}
+
 fn add_builtins(data_space: &mut DataSpace) {
-    data_space.push_builtin_word("BYE", bye_builtin);
-    data_space.push_builtin_word("DROP", drop_builtin);
-    data_space.push_builtin_word("DUP", dup_builtin);
-    data_space.push_builtin_word("SWAP", swap_builtin);
-    data_space.push_builtin_word("EXIT", exit_builtin);
-    data_space.push_builtin_word("KEY", key_builtin);
-    data_space.push_builtin_word("EMIT", emit_builtin);
-    data_space.push_builtin_word("WORD", word_builtin);
-    data_space.push_builtin_word("!", store_builtin);
-    data_space.push_builtin_word("@", fetch_builtin);
-    data_space.push_builtin_word("S>NUMBER?", number_builtin);
-    data_space.push_builtin_word("FIND", find_builtin);
-    data_space.push_builtin_word(">CFA", to_cfa_builtin);
-    data_space.push_builtin_word("BRANCH", branch_builtin);
-    data_space.push_builtin_word("0BRANCH", zbranch_builtin);
-    data_space.push_builtin_word("LIT", lit_builtin);
+    data_space.push_builtin_word("DOCOL", 0, docol_builtin);
+    data_space.push_builtin_word("BYE", 0, bye_builtin);
+    data_space.push_builtin_word("DROP", 0, drop_builtin);
+    data_space.push_builtin_word("DUP", 0, dup_builtin);
+    data_space.push_builtin_word("SWAP", 0, swap_builtin);
+    data_space.push_builtin_word("EXIT", 0, exit_builtin);
+    data_space.push_builtin_word("KEY", 0, key_builtin);
+    data_space.push_builtin_word("EMIT", 0, emit_builtin);
+    data_space.push_builtin_word("WORD", 0, word_builtin);
+    data_space.push_builtin_word("!", 0, store_builtin);
+    data_space.push_builtin_word("@", 0, fetch_builtin);
+    data_space.push_builtin_word("S>NUMBER?", 0, number_builtin);
+    data_space.push_builtin_word("FIND", 0, find_builtin);
+    data_space.push_builtin_word("LATEST", 0, latest_builtin);
+    data_space.push_builtin_word(">CFA", 0, to_cfa_builtin);
+    data_space.push_builtin_word("HIDDEN", 0, hidden_builtin);
+    data_space.push_builtin_word("IMMEDIATE", WordFlag::Immediate as usize, immediate_builtin);
+    data_space.push_builtin_word("BRANCH", 0, branch_builtin);
+    data_space.push_builtin_word("0BRANCH", 0, zbranch_builtin);
+    data_space.push_builtin_word("LIT", 0, lit_builtin);
+    data_space.push_builtin_word("CREATE", 0, create_builtin);
+    data_space.push_builtin_word(",", 0, comma_builtin);
+    data_space.push_builtin_word("[", WordFlag::Immediate as usize, lbrac_builtin);
+    data_space.push_builtin_word("]", 0, rbrac_builtin);
 }
 
 fn exec_fun_indirect(addr: usize, forth: &mut ForthMachine) {
@@ -627,12 +732,12 @@ fn push_instruction(data_space: &mut DataSpace, def_addr: usize) -> usize {
     cursor.into_inner().as_ptr() as usize
 }
 
-fn push_word<'a, I>(data_space: &mut DataSpace, name: &str, words: I)
+fn push_word<'a, I>(data_space: &mut DataSpace, name: &str, flags: usize, words: I)
 where
     I: IntoIterator<Item = &'a str>,
 {
-    assert!(data_space.push_dict_entry(name));
-    push_instruction(data_space, docol as usize);
+    assert!(data_space.push_dict_entry(name, flags));
+    push_instruction(data_space, docol_builtin as usize);
     for word in words {
         match data_space.find_entry(word) {
             Some(entry) => push_instruction(data_space, entry.definition_addr()),
@@ -742,12 +847,28 @@ fn main() {
     );
     push_word(
         &mut forth.data_space,
+        ":",
+        0,
+        [
+            "WORD", "CREATE", "LIT", "DOCOL", ",", "LATEST", /* "@", */ "HIDDEN", "]",
+        ],
+    );
+    push_word(
+        &mut forth.data_space,
+        ";",
+        WordFlag::Immediate as usize,
+        ["LIT", "EXIT", ",", "LATEST", /* "@", */ "HIDDEN", "["],
+    );
+    push_word(
+        &mut forth.data_space,
         "INTERPRET",
-        ["WORD", "FIND", "DUP", "0BRANCH", "8", "BYE", "BYE"],
+        0,
+        ["WORD", "FIND", "DUP", "0BRANCH", "8", "1", "0"],
     );
     push_word(
         &mut forth.data_space,
         "GO",
+        0,
         ["KEY", "EMIT", "WORD", "S>NUMBER?", "42", "DUP"],
     );
     set_instructions(&mut forth, ["GO"]);
