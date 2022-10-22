@@ -340,6 +340,8 @@ fn test_data_space_find_entry() {
     }
 }
 
+const FORTH_TRUE: isize = -1;
+const FORTH_FALSE: isize = 0;
 const INPUT_BUFFER_SIZE: usize = 4096;
 const WORD_BUFFER_SIZE: usize = 32;
 
@@ -492,6 +494,33 @@ fn fetch_builtin(forth: &mut ForthMachine) {
     forth.data_stack.push(*addr_ref)
 }
 
+// Converts string to number, flag indicates success.
+// (addr u - d f)
+fn number_builtin(forth: &mut ForthMachine) {
+    let byte_len = forth.data_stack.pop().unwrap() as usize;
+    let ptr = forth.data_stack.pop().unwrap() as *const u8;
+    if byte_len == 0 {
+        forth.data_stack.push(0);
+        forth.data_stack.push(FORTH_FALSE);
+        return;
+    }
+    assert!(forth.data_space.is_valid_ptr(ptr));
+    assert!(forth
+        .data_space
+        .is_valid_ptr((ptr as usize + byte_len - 1) as *const u8));
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
+    match std::str::from_utf8(bytes).unwrap().parse() {
+        Ok(num) => {
+            forth.data_stack.push(num);
+            forth.data_stack.push(FORTH_TRUE);
+        }
+        _ => {
+            forth.data_stack.push(0);
+            forth.data_stack.push(FORTH_FALSE);
+        }
+    }
+}
+
 fn add_builtins(data_space: &mut DataSpace) {
     data_space.push_builtin_word("BYE", bye_builtin);
     data_space.push_builtin_word("DROP", drop_builtin);
@@ -503,6 +532,7 @@ fn add_builtins(data_space: &mut DataSpace) {
     data_space.push_builtin_word("WORD", word_builtin);
     data_space.push_builtin_word("!", store_builtin);
     data_space.push_builtin_word("@", fetch_builtin);
+    data_space.push_builtin_word("S>NUMBER?", number_builtin);
 }
 
 fn exec_fun_indirect(addr: usize, forth: &mut ForthMachine) {
@@ -656,7 +686,7 @@ fn main() {
     push_word(
         &mut forth.data_space,
         "GO",
-        ["KEY", "EMIT", "WORD", "SWAP", "@", "EMIT"],
+        ["KEY", "EMIT", "WORD", "S>NUMBER?"],
     );
     set_instructions(&mut forth, ["GO"]);
     while forth.instruction_addr != 0 {
