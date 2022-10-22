@@ -1,3 +1,4 @@
+use clap::Parser;
 use std::convert::TryFrom;
 use std::io::{Read, Write};
 
@@ -582,13 +583,76 @@ where
     push_instruction(&mut forth.data_space, def_addr);
 }
 
+fn parse_memsize(val: &str) -> clap::error::Result<usize> {
+    let last_char = val.chars().last().ok_or_else(|| {
+        clap::error::Error::raw(clap::error::ErrorKind::ValueValidation, "empty value")
+    })?;
+    let (unit, val) = match last_char {
+        'b' => (1, &val[..val.len() - 1]),
+        'k' => (1024, &val[..val.len() - 1]),
+        'M' => (1024 * 1024, &val[..val.len() - 1]),
+        'G' => (1024 * 1024 * 1024, &val[..val.len() - 1]),
+        // Default is 'k'
+        _ => (1024, val),
+    };
+    let num: usize = val
+        .parse()
+        .map_err(|e| clap::error::Error::raw(clap::error::ErrorKind::ValueValidation, e))?;
+    Ok(num * unit)
+}
+
+fn fmt_memsize(bytes: usize) -> String {
+    let chars = bytes
+        .to_string()
+        .chars()
+        .rev()
+        .enumerate()
+        .fold(Vec::new(), |mut res, (i, ch)| {
+            res.push(ch);
+            if (i + 1) % 3 == 0 {
+                res.push(',');
+            }
+            res
+        });
+    if chars.last().unwrap() == &',' {
+        chars.iter().rev().skip(1).collect()
+    } else {
+        chars.iter().rev().collect()
+    }
+}
+
+#[derive(Parser)]
+#[command(name = "rForth")]
+#[command(about = "Simple Forth Virtual Machine")]
+struct CliArgs {
+    /// Size of total memory used for Forth's data space.
+    ///
+    /// You may suffix the number with one of 'b', 'k', 'M' & 'G' to specify
+    /// the size unit. Omitting the suffix defaults to 'k', i.e. kilobytes.
+    #[arg(long, default_value = "4k", value_parser = parse_memsize)]
+    data_space_size: usize,
+    /// Maximum number of cells on the data stack.
+    #[arg(long, default_value_t = 256)]
+    data_stack_size: usize,
+    /// Maximum number of cells on the return stack.
+    #[arg(long, default_value_t = 256)]
+    return_stack_size: usize,
+}
+
 fn main() {
-    let mut forth = ForthMachine::new(
-        DataSpace::with_size(1024),
-        Vec::with_capacity(256),
-        Vec::with_capacity(256),
-    );
+    let cli_args = CliArgs::parse();
     println!("Welcome to rForth");
+    println!(
+        "data_space_size = {} bytes",
+        fmt_memsize(cli_args.data_space_size)
+    );
+    println!("data_stack_size = {} cells", cli_args.data_stack_size);
+    println!("return_stack_size = {} cells", cli_args.return_stack_size);
+    let mut forth = ForthMachine::new(
+        DataSpace::with_size(cli_args.data_space_size),
+        Vec::with_capacity(cli_args.data_stack_size),
+        Vec::with_capacity(cli_args.return_stack_size),
+    );
     push_word(
         &mut forth.data_space,
         "GO",
@@ -598,5 +662,6 @@ fn main() {
     while forth.instruction_addr != 0 {
         next(&mut forth);
     }
-    println!("\nforth.data_stack: {:?}", forth.data_stack);
+    println!("\nBye!");
+    dbg!(forth.data_stack);
 }
