@@ -177,7 +177,7 @@ impl<'a> DictEntryRef<'a> {
         usize::from_ne_bytes(<[u8; PTR_SIZE]>::try_from(flags_buf).unwrap())
     }
 
-    pub fn set_flags(&mut self, flags: usize) {
+    fn set_flags(&mut self, flags: usize) {
         let flags_buf = &mut self.ptr_as_slice_mut()[PTR_SIZE..][..PTR_SIZE];
         let mut cursor = std::io::Cursor::new(flags_buf);
         cursor.write_all(&flags.to_ne_bytes()).unwrap();
@@ -199,14 +199,22 @@ impl<'a> DictEntryRef<'a> {
     pub fn toggle_hidden(&mut self) -> bool {
         let new_flags = self.flags() ^ WordFlag::Hidden as usize;
         self.set_flags(new_flags);
-        (new_flags & WordFlag::Hidden as usize) != 0
+        self.is_hidden()
+    }
+
+    pub fn is_hidden(&self) -> bool {
+        (self.flags() & WordFlag::Hidden as usize) != 0
     }
 
     // Return true if now immediate.
     pub fn toggle_immediate(&mut self) -> bool {
         let new_flags = self.flags() ^ WordFlag::Immediate as usize;
         self.set_flags(new_flags);
-        (new_flags & WordFlag::Immediate as usize) != 0
+        self.is_immediate()
+    }
+
+    pub fn is_immediate(&self) -> bool {
+        (self.flags() & WordFlag::Immediate as usize) != 0
     }
 }
 
@@ -214,11 +222,13 @@ impl std::fmt::Debug for DictEntryRef<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "DictEntryRef {{ ptr: {:p}, end_of_data_space: {:p}, prev: {:p}, name: {} }}",
+            "DictEntryRef {{ ptr: {:p}, end_of_data_space: {:p}, prev: {:p}, name: {}, flags: {:#x}, definition_addr: {:p} }}",
             self.ptr as *const u8,
             self.data_space.end() as *const u8,
             self.prev().map_or(std::ptr::null(), |e| e.ptr),
-            self.name()
+            self.name(),
+            self.flags(),
+            self.definition_addr() as *const u8,
         )
     }
 }
@@ -230,7 +240,7 @@ impl std::fmt::Debug for DictEntryRef<'_> {
 struct DataSpace {
     memory: Memory,
     dict_head: *const u8,
-    builtin_addrs: Vec<usize>,
+    builtin_addrs: Vec<(usize, String)>,
 }
 
 impl DataSpace {
@@ -317,7 +327,7 @@ impl DataSpace {
     pub fn find_entry(&self, name: &str) -> Option<DictEntryRef<'_>> {
         let mut maybe_entry = self.latest_entry();
         while let Some(entry) = maybe_entry {
-            if entry.name() == name {
+            if !entry.is_hidden() && entry.name() == name {
                 return maybe_entry;
             } else {
                 maybe_entry = entry.prev();
@@ -327,7 +337,10 @@ impl DataSpace {
     }
 
     pub fn is_builtin_addr(&self, addr: usize) -> bool {
-        self.builtin_addrs.contains(&addr)
+        self.builtin_addrs
+            .iter()
+            .find(|(a, _)| *a == addr)
+            .is_some()
     }
 
     pub fn push_builtin_word(&mut self, name: &str, flags: usize, word_fn: fn(&mut ForthMachine)) {
@@ -335,7 +348,7 @@ impl DataSpace {
         {
             let fn_addr = word_fn as usize;
             if !self.is_builtin_addr(fn_addr) {
-                self.builtin_addrs.push(fn_addr);
+                self.builtin_addrs.push((fn_addr, name.to_string()));
             }
             let bytes = self.alloc(PTR_SIZE).unwrap();
             let mut cursor = std::io::Cursor::new(bytes);
@@ -348,14 +361,14 @@ impl DataSpace {
 fn test_data_space_find_entry() {
     let mut data_space = DataSpace::with_size(1024);
     assert!(data_space.find_entry("DUP").is_none());
-    assert!(data_space.push_dict_entry("DUP"));
+    assert!(data_space.push_dict_entry("DUP", 0));
     {
         let dup = data_space.find_entry("DUP").unwrap();
         assert_eq!(dup.name(), "DUP");
         let latest = data_space.latest_entry().unwrap();
         assert!(std::ptr::eq(dup.ptr, latest.ptr));
     }
-    assert!(data_space.push_dict_entry("SWAP"));
+    assert!(data_space.push_dict_entry("SWAP", 0));
     {
         let dup = data_space.find_entry("DUP").unwrap();
         assert_eq!(dup.name(), "DUP");
@@ -363,7 +376,7 @@ fn test_data_space_find_entry() {
         assert!(!std::ptr::eq(dup.ptr, latest.ptr));
         assert!(std::ptr::eq(dup.ptr, latest.prev().unwrap().ptr));
     }
-    assert!(data_space.push_dict_entry("DUP"));
+    assert!(data_space.push_dict_entry("DUP", 0));
     {
         let dup = data_space.find_entry("DUP").unwrap();
         assert_eq!(dup.name(), "DUP");
@@ -384,7 +397,7 @@ const FORTH_FALSE: isize = 0;
 const INPUT_BUFFER_SIZE: usize = 4096;
 const WORD_BUFFER_SIZE: usize = 32;
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum ForthState {
     Immediate = 0,
     Compile = 1,
@@ -496,30 +509,31 @@ fn emit_builtin(forth: &mut ForthMachine) {
 
 const BLANK_CHARS: [char; 3] = [' ', '\t', '\n'];
 
+fn do_word_builtin(forth: &mut ForthMachine) -> Option<()> {
+    let mut byte = read_stdin_byte(forth).unwrap()?;
+    // Skip comment until newline
+    if byte == b'\\' {
+        while byte != b'\n' {
+            byte = read_stdin_byte(forth).unwrap()?;
+        }
+    }
+    // Skip blanks
+    while BLANK_CHARS.contains(&byte.into()) {
+        byte = read_stdin_byte(forth).unwrap()?;
+    }
+    let mut word_buffer_ix = 0;
+    while !BLANK_CHARS.contains(&byte.into()) {
+        assert!(word_buffer_ix < WORD_BUFFER_SIZE);
+        forth.word_buffer()[word_buffer_ix] = byte;
+        byte = read_stdin_byte(forth).unwrap()?;
+        word_buffer_ix += 1;
+    }
+    forth.data_stack.push(forth.word_buffer_ptr as isize);
+    forth.data_stack.push(word_buffer_ix as isize); // len
+    Some(())
+}
+
 fn word_builtin(forth: &mut ForthMachine) {
-    let do_word_builtin = |forth: &mut ForthMachine| -> Option<()> {
-        let mut byte = read_stdin_byte(forth).unwrap()?;
-        // Skip comment until newline
-        if byte == b'\\' {
-            while byte != b'\n' {
-                byte = read_stdin_byte(forth).unwrap()?;
-            }
-        }
-        // Skip blanks
-        while BLANK_CHARS.contains(&byte.into()) {
-            byte = read_stdin_byte(forth).unwrap()?;
-        }
-        let mut word_buffer_ix = 0;
-        while !BLANK_CHARS.contains(&byte.into()) {
-            assert!(word_buffer_ix < WORD_BUFFER_SIZE);
-            forth.word_buffer()[word_buffer_ix] = byte;
-            byte = read_stdin_byte(forth).unwrap()?;
-            word_buffer_ix += 1;
-        }
-        forth.data_stack.push(forth.word_buffer_ptr as isize);
-        forth.data_stack.push(word_buffer_ix as isize); // len
-        Some(())
-    };
     if do_word_builtin(forth).is_none() {
         bye_builtin(forth)
     }
@@ -555,6 +569,7 @@ fn number_builtin(forth: &mut ForthMachine) {
         .data_space
         .is_valid_ptr((ptr as usize + byte_len - 1) as *const u8));
     let bytes = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
+    // TODO: Use BASE variable for parsing.
     match std::str::from_utf8(bytes).unwrap().parse() {
         Ok(num) => {
             forth.data_stack.push(num);
@@ -624,10 +639,17 @@ fn immediate_builtin(forth: &mut ForthMachine) {
 }
 
 fn branch_builtin(forth: &mut ForthMachine) {
-    let ptr_to_offset = forth.instruction_addr as *const usize;
+    let ptr_to_offset = forth.instruction_addr as *const isize;
     assert!(forth.data_space.is_valid_ptr(ptr_to_offset));
     let offset = unsafe { *ptr_to_offset };
-    forth.instruction_addr.checked_add(offset).unwrap();
+    if offset >= 0 {
+        forth.instruction_addr = forth.instruction_addr.checked_add(offset as usize).unwrap();
+    } else {
+        forth.instruction_addr = forth
+            .instruction_addr
+            .checked_sub(offset.unsigned_abs())
+            .unwrap();
+    }
 }
 
 fn zbranch_builtin(forth: &mut ForthMachine) {
@@ -640,11 +662,12 @@ fn zbranch_builtin(forth: &mut ForthMachine) {
 }
 
 fn lit_builtin(forth: &mut ForthMachine) {
-    let ptr_to_val = forth.instruction_addr as *const usize;
+    let ptr_to_val = forth.instruction_addr as *const isize;
     assert!(forth.data_space.is_valid_ptr(ptr_to_val));
     let val = unsafe { *ptr_to_val };
+    println!("val: {:#x}", val);
     forth.instruction_addr = forth.instruction_addr.checked_add(PTR_SIZE).unwrap();
-    forth.data_stack.push(val as isize);
+    forth.data_stack.push(val);
 }
 
 fn create_builtin(forth: &mut ForthMachine) {
@@ -672,6 +695,45 @@ fn rbrac_builtin(forth: &mut ForthMachine) {
     forth.state = ForthState::Compile;
 }
 
+fn interpret_builtin(forth: &mut ForthMachine) {
+    if do_word_builtin(forth).is_none() {
+        return bye_builtin(forth);
+    }
+    let byte_len = forth.data_stack.pop().unwrap() as usize;
+    let ptr = forth.data_stack.pop().unwrap() as *const u8;
+    assert!(forth.data_space.is_valid_ptr(ptr));
+    assert!(forth
+        .data_space
+        .is_valid_ptr((ptr as usize + byte_len - 1) as *const u8));
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
+    let name = std::str::from_utf8(bytes).unwrap();
+    if let Some(dict_entry_ref) = forth.data_space.find_entry(name) {
+        dbg!(dict_entry_ref);
+        if dict_entry_ref.is_immediate() || forth.state == ForthState::Immediate {
+            exec_fun_indirect(dict_entry_ref.definition_addr(), forth);
+        } else {
+            // Compiling
+            let def_addr = dict_entry_ref.definition_addr();
+            let def_addr = unsafe { *(def_addr as *const usize) };
+            push_instruction(&mut forth.data_space, def_addr);
+        }
+    } else {
+        // TODO: Use BASE variable for parsing.
+        let num: isize = name.parse().unwrap();
+        match forth.state {
+            ForthState::Immediate => forth.data_stack.push(num),
+            ForthState::Compile => {
+                push_instruction(&mut forth.data_space, lit_builtin as usize);
+                push_instruction(&mut forth.data_space, num as usize);
+            }
+        }
+    }
+}
+
+fn rs_clear_builtin(forth: &mut ForthMachine) {
+    forth.return_stack.clear();
+}
+
 fn add_builtins(data_space: &mut DataSpace) {
     data_space.push_builtin_word("DOCOL", 0, docol_builtin);
     data_space.push_builtin_word("BYE", 0, bye_builtin);
@@ -697,16 +759,29 @@ fn add_builtins(data_space: &mut DataSpace) {
     data_space.push_builtin_word(",", 0, comma_builtin);
     data_space.push_builtin_word("[", WordFlag::Immediate as usize, lbrac_builtin);
     data_space.push_builtin_word("]", 0, rbrac_builtin);
+    data_space.push_builtin_word("INTERPRET", 0, interpret_builtin);
+    data_space.push_builtin_word("RS-CLEAR", 0, rs_clear_builtin);
 }
 
 fn exec_fun_indirect(addr: usize, forth: &mut ForthMachine) {
+    forth.curr_def_addr = addr;
+    println!("forth.curr_def_addr: {:#x}", forth.curr_def_addr);
     assert!(
         forth.data_space.is_valid_ptr(addr as *const usize),
         "'{addr:#x} ({addr})' is not a valid ptr",
         addr = addr,
     );
     let fun_addr = unsafe { *(addr as *const usize) };
-    assert!(forth.data_space.is_builtin_addr(fun_addr));
+    let maybe_builtin = forth
+        .data_space
+        .builtin_addrs
+        .iter()
+        .find(|(a, _)| *a == fun_addr);
+    match maybe_builtin {
+        None => println!("Executing fun at {:#x}", fun_addr),
+        Some((_, name)) => println!("Executing '{}' ({:#x})", name, fun_addr),
+    }
+    assert!(maybe_builtin.is_some());
     let fun: fn(&mut ForthMachine) = unsafe { std::mem::transmute(fun_addr as *const u8) };
     fun(forth)
 }
@@ -718,9 +793,11 @@ fn next(forth: &mut ForthMachine) {
     assert!(forth
         .data_space
         .is_valid_ptr(forth.instruction_addr as *const usize));
-    let def_addr = unsafe { *(forth.instruction_addr as *const usize) };
-    forth.curr_def_addr = def_addr;
+    // let def_addr = unsafe { *(forth.instruction_addr as *const usize) };
+    let def_addr = forth.instruction_addr;
     forth.instruction_addr = forth.instruction_addr.checked_add(PTR_SIZE).unwrap();
+    // println!("curr_def_addr at {:#x}", def_addr);
+    // println!("instruction_addr at {:#x}", forth.instruction_addr);
     exec_fun_indirect(def_addr, forth);
 }
 
@@ -740,18 +817,22 @@ where
     push_instruction(data_space, docol_builtin as usize);
     for word in words {
         match data_space.find_entry(word) {
-            Some(entry) => push_instruction(data_space, entry.definition_addr()),
+            Some(entry) => {
+                let def_addr = unsafe { *(entry.definition_addr() as *const usize) };
+                push_instruction(data_space, def_addr);
+            }
             None => {
                 let num: isize = word.parse().unwrap();
-                push_instruction(
-                    data_space,
-                    data_space.find_entry("LIT").unwrap().definition_addr(),
-                );
-                push_instruction(data_space, num as usize)
+                // push_instruction(
+                //     data_space,
+                //     data_space.find_entry("LIT").unwrap().definition_addr(),
+                // );
+                push_instruction(data_space, num as usize);
             }
         };
     }
     let def_addr = data_space.find_entry("EXIT").unwrap().definition_addr();
+    let def_addr = unsafe { *(def_addr as *const usize) };
     push_instruction(data_space, def_addr);
 }
 
@@ -762,9 +843,13 @@ where
     assert!(forth.data_space.align());
     for word in words {
         let def_addr = forth.data_space.find_entry(word).unwrap().definition_addr();
-        let instruction_addr = push_instruction(&mut forth.data_space, def_addr);
+        {
+            let def_addr = unsafe { *(def_addr as *const usize) };
+            let instruction_addr = push_instruction(&mut forth.data_space, def_addr);
+        }
         if forth.instruction_addr == 0 {
-            forth.instruction_addr = instruction_addr;
+            // forth.instruction_addr = instruction_addr;
+            forth.instruction_addr = def_addr;
         }
     }
     let def_addr = forth
@@ -772,6 +857,7 @@ where
         .find_entry("BYE")
         .unwrap()
         .definition_addr();
+    let def_addr = unsafe { *(def_addr as *const usize) };
     push_instruction(&mut forth.data_space, def_addr);
 }
 
@@ -861,17 +947,16 @@ fn main() {
     );
     push_word(
         &mut forth.data_space,
-        "INTERPRET",
+        "QUIT",
         0,
-        ["WORD", "FIND", "DUP", "0BRANCH", "8", "1", "0"],
+        ["RS-CLEAR", "INTERPRET", "BRANCH", "-16"],
     );
-    push_word(
-        &mut forth.data_space,
-        "GO",
-        0,
-        ["KEY", "EMIT", "WORD", "S>NUMBER?", "42", "DUP"],
-    );
-    set_instructions(&mut forth, ["GO"]);
+    // set_instructions(&mut forth, ["QUIT"]);
+    forth.instruction_addr = forth
+        .data_space
+        .find_entry("QUIT")
+        .unwrap()
+        .definition_addr();
     while forth.instruction_addr != 0 {
         next(&mut forth);
     }
