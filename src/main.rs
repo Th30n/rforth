@@ -74,15 +74,32 @@ impl Memory {
         true
     }
 
-    pub fn alloc(&mut self, bytes: usize) -> Option<&mut [u8]> {
+    // NOTE: Previously, `alloc` would return `Option<&mut [u8]>`. But this
+    // causes UB when *reading* or *writing* any other previously returned
+    // allocation. In other words, `&mut` provides exclusive access into `self`,
+    // and thus returning `&mut [u8]` invalidates old pointers.
+    //
+    // https://doc.rust-lang.org/std/slice/fn.from_raw_parts_mut.html
+    //
+    //   The memory referenced by the returned slice must not be accessed
+    //   through any other pointer (not derived from the return value) for the
+    //   duration of lifetime 'a. Both read and write accesses are forbidden.
+    //
+    // Running the original code through MIRI would trigger an error
+    //
+    //   error: Undefined Behavior: trying to retag from <255807> for
+    //          SharedReadOnly permission at alloc61163[0x529], but that tag
+    //          does not exist in the borrow stack for this location
+    //
+    // And MIRI would point for further information here:
+    // https://github.com/rust-lang/unsafe-code-guidelines/blob/master/wip/stacked-borrows.md
+    pub fn alloc(&mut self, bytes: usize) -> Option<*mut u8> {
         if bytes > self.unused() {
             None
         } else {
-            unsafe {
-                let ret = std::slice::from_raw_parts_mut(self.current, bytes);
-                self.current = self.current.add(bytes);
-                Some(ret)
-            }
+            let ret = self.current;
+            self.current = unsafe { self.current.add(bytes) };
+            Some(ret)
         }
     }
 
@@ -288,7 +305,7 @@ impl DataSpace {
         self.memory.align()
     }
 
-    pub fn alloc(&mut self, bytes: usize) -> Option<&mut [u8]> {
+    pub fn alloc(&mut self, bytes: usize) -> Option<*mut u8> {
         self.memory.alloc(bytes)
     }
 
@@ -308,13 +325,13 @@ impl DataSpace {
         let entry_size = PTR_SIZE + PTR_SIZE + PTR_SIZE + name.len();
         match self.alloc(entry_size) {
             None => false,
-            Some(buf) => {
+            Some(entry_ptr) => {
+                let buf = unsafe { std::slice::from_raw_parts_mut(entry_ptr, entry_size) };
                 let mut cursor = std::io::Cursor::new(buf);
                 cursor.write_all(&prev_addr.to_ne_bytes()).unwrap();
                 cursor.write_all(&flags.to_ne_bytes()).unwrap();
                 cursor.write_all(&name.len().to_ne_bytes()).unwrap();
                 cursor.write_all(name.as_bytes()).unwrap();
-                let entry_ptr = cursor.into_inner().as_mut_ptr();
                 if !self.align() {
                     assert!(self.dealloc(entry_size));
                     false
@@ -356,15 +373,14 @@ impl DataSpace {
 
     pub fn push_builtin_word(&mut self, name: &str, flags: usize, word_fn: fn(&mut ForthMachine)) {
         assert!(self.push_dict_entry(name, flags));
-        {
-            let fn_addr = word_fn as usize;
-            if !self.is_builtin_addr(fn_addr) {
-                self.builtin_addrs.push((fn_addr, name.to_string()));
-            }
-            let bytes = self.alloc(PTR_SIZE).unwrap();
-            let mut cursor = std::io::Cursor::new(bytes);
-            cursor.write_all(&fn_addr.to_ne_bytes()).unwrap();
+        let fn_addr = word_fn as usize;
+        if !self.is_builtin_addr(fn_addr) {
+            self.builtin_addrs.push((fn_addr, name.to_string()));
         }
+        let ptr = self.alloc(PTR_SIZE).unwrap();
+        let buf = unsafe { std::slice::from_raw_parts_mut(ptr, PTR_SIZE) };
+        let mut cursor = std::io::Cursor::new(buf);
+        cursor.write_all(&fn_addr.to_ne_bytes()).unwrap();
     }
 }
 
@@ -437,7 +453,7 @@ impl ForthMachine {
         data_stack: Vec<isize>,
         return_stack: Vec<isize>,
     ) -> Self {
-        let word_buffer_ptr = data_space.alloc(WORD_BUFFER_SIZE).unwrap().as_mut_ptr();
+        let word_buffer_ptr = data_space.alloc(WORD_BUFFER_SIZE).unwrap();
         assert!(data_space.align());
         add_builtins(&mut data_space);
         Self {
@@ -864,7 +880,8 @@ fn next(forth: &mut ForthMachine) {
 
 fn push_instruction(data_space: &mut DataSpace, def_addr: usize) -> usize {
     assert!(is_aligned(data_space.memory.current as usize, PTR_SIZE));
-    let instruction_buf = data_space.alloc(PTR_SIZE).unwrap();
+    let ptr = data_space.alloc(PTR_SIZE).unwrap();
+    let instruction_buf = unsafe { std::slice::from_raw_parts_mut(ptr, PTR_SIZE) };
     let mut cursor = std::io::Cursor::new(instruction_buf);
     cursor.write_all(&def_addr.to_ne_bytes()).unwrap();
     cursor.into_inner().as_ptr() as usize
