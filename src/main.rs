@@ -571,6 +571,21 @@ fn fetch_builtin(forth: &mut ForthMachine) {
     forth.data_stack.push(*addr_ref)
 }
 
+fn store_byte_builtin(forth: &mut ForthMachine) {
+    let ptr = forth.data_stack.pop().unwrap() as *mut u8;
+    assert!(forth.data_space.is_valid_ptr(ptr));
+    let val = forth.data_stack.pop().unwrap() as u8;
+    let addr_ref = unsafe { ptr.as_mut().unwrap() };
+    *addr_ref = val
+}
+
+fn fetch_byte_builtin(forth: &mut ForthMachine) {
+    let ptr = forth.data_stack.pop().unwrap() as *const u8;
+    assert!(forth.data_space.is_valid_ptr(ptr));
+    let addr_ref = unsafe { ptr.as_ref().unwrap() };
+    forth.data_stack.push(*addr_ref as isize)
+}
+
 // Converts string to number, flag indicates success.
 // (addr u - d f)
 fn number_builtin(forth: &mut ForthMachine) {
@@ -787,6 +802,8 @@ fn add_builtins(data_space: &mut DataSpace) {
     data_space.push_builtin_word("WORD", 0, word_builtin);
     data_space.push_builtin_word("!", 0, store_builtin);
     data_space.push_builtin_word("@", 0, fetch_builtin);
+    data_space.push_builtin_word("C!", 0, store_byte_builtin);
+    data_space.push_builtin_word("C@", 0, fetch_byte_builtin);
     data_space.push_builtin_word("S>NUMBER?", 0, number_builtin);
     data_space.push_builtin_word("FIND", 0, find_builtin);
     data_space.push_builtin_word("LATEST", 0, latest_builtin);

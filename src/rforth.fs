@@ -10,16 +10,34 @@
 \ Overwrite original ' to now parse at run-time.
 : ' WORD FIND >CFA ;
 
+\ Compile a `word` that would otherwise be IMMEDIATE.
+: [COMPILE] IMMEDIATE
+    WORD FIND >CFA ,
+;
+
 \ Take whatever `val` is on stack and compile LIT `val`.
 : LITERAL IMMEDIATE
     ['] LIT , \ compile LIT
     ,         \ compile `val` from stack
 ;
 
-\ Compile a `word` that would otherwise be IMMEDIATE.
-: [COMPILE] IMMEDIATE
-    WORD FIND >CFA ,
+\ Read a word and put the first character on stack.
+: CHAR
+  WORD
+  DROP  \ Drop the length part
+  C@    \ WORD should invoke BYE on zero length string, so this is safe
 ;
+
+\ CHAR for parsing at compile-time
+: [CHAR] IMMEDIATE  CHAR [COMPILE] LITERAL ;
+
+\ Put blank (space) on stack.
+: BL  32 ;
+
+: SPACE BL EMIT ;
+
+\ Emit carriage return (\n here).
+: CR  10 EMIT ;
 
 : IF IMMEDIATE
     ['] 0BRANCH , \ compile 0BRANCH
