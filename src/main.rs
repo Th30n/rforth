@@ -146,7 +146,7 @@ enum WordFlag {
 struct DictEntryRef<'a> {
     data_space: &'a DataSpace,
     /// Points to start of the entry in DataSpace.
-    ptr: &'a u8,
+    ptr: *mut u8,
 }
 
 impl<'a> DictEntryRef<'a> {
@@ -157,25 +157,25 @@ impl<'a> DictEntryRef<'a> {
     }
 
     fn ptr_as_slice_mut(&mut self) -> &mut [u8] {
-        let ptr = self.ptr as *const u8 as *mut u8;
-        assert!(self.data_space.is_valid_ptr(ptr));
-        unsafe { std::slice::from_raw_parts_mut(ptr, self.data_space.end() - ptr as usize) }
+        assert!(self.data_space.is_valid_ptr(self.ptr));
+        unsafe {
+            std::slice::from_raw_parts_mut(self.ptr, self.data_space.end() - self.ptr as usize)
+        }
     }
 
     pub fn prev(&self) -> Option<DictEntryRef<'a>> {
         let buf_slice = self.ptr_as_slice();
         let prev_bytes = <[u8; PTR_SIZE]>::try_from(&buf_slice[0..PTR_SIZE]).unwrap();
-        let prev_ptr = usize::from_ne_bytes(prev_bytes) as *const u8;
+        let prev_ptr = usize::from_ne_bytes(prev_bytes) as *mut u8;
         if prev_ptr.is_null() {
             None
         } else {
             // TODO: Make this assertion an actionable error, as it is possible
             // to overwrite the prev_addr to something invalid in Forth.
             assert!(self.data_space.is_valid_ptr(prev_ptr));
-            let prev = unsafe { &*prev_ptr };
             Some(DictEntryRef {
                 data_space: self.data_space,
-                ptr: prev,
+                ptr: prev_ptr,
             })
         }
     }
@@ -247,7 +247,7 @@ impl std::fmt::Debug for DictEntryRef<'_> {
 #[derive(Debug)]
 struct DataSpace {
     memory: Memory,
-    dict_head: *const u8,
+    dict_head: *mut u8,
     builtin_addrs: Vec<(usize, String)>,
 }
 
@@ -257,7 +257,7 @@ impl DataSpace {
         builtin_addrs.push((docol as usize, "DOCOL".to_string()));
         DataSpace {
             memory: Memory::with_size(bytes),
-            dict_head: std::ptr::null(),
+            dict_head: std::ptr::null_mut(),
             builtin_addrs,
         }
     }
@@ -314,7 +314,7 @@ impl DataSpace {
                 cursor.write_all(&flags.to_ne_bytes()).unwrap();
                 cursor.write_all(&name.len().to_ne_bytes()).unwrap();
                 cursor.write_all(name.as_bytes()).unwrap();
-                let entry_ptr = cursor.into_inner().as_ptr();
+                let entry_ptr = cursor.into_inner().as_mut_ptr();
                 if !self.align() {
                     assert!(self.dealloc(entry_size));
                     false
@@ -327,14 +327,15 @@ impl DataSpace {
     }
 
     pub fn latest_entry(&self) -> Option<DictEntryRef<'_>> {
-        let maybe_entry = unsafe { self.dict_head.as_ref() };
-        maybe_entry.map(|ptr| {
-            assert!(self.is_valid_ptr(ptr as *const u8));
-            DictEntryRef {
+        if self.dict_head.is_null() {
+            None
+        } else {
+            assert!(self.is_valid_ptr(self.dict_head));
+            Some(DictEntryRef {
                 data_space: self,
-                ptr,
-            }
-        })
+                ptr: self.dict_head,
+            })
+        }
     }
 
     pub fn find_entry(&self, name: &str) -> Option<DictEntryRef<'_>> {
@@ -639,8 +640,7 @@ fn latest_builtin(forth: &mut ForthMachine) {
 
 // Return Code Field Address (i.e. definition address of a dict entry).
 fn to_cfa_builtin(forth: &mut ForthMachine) {
-    let ptr = forth.data_stack.pop().unwrap() as *const u8;
-    let ptr = unsafe { ptr.as_ref() }.unwrap();
+    let ptr = forth.data_stack.pop().unwrap() as *mut u8;
     let dict_entry_ref = DictEntryRef {
         data_space: &forth.data_space,
         ptr,
@@ -651,8 +651,7 @@ fn to_cfa_builtin(forth: &mut ForthMachine) {
 }
 
 fn hidden_builtin(forth: &mut ForthMachine) {
-    let ptr = forth.data_stack.pop().unwrap() as *const u8;
-    let ptr = unsafe { ptr.as_ref() }.unwrap();
+    let ptr = forth.data_stack.pop().unwrap() as *mut u8;
     let mut dict_entry_ref = DictEntryRef {
         data_space: &forth.data_space,
         ptr,
