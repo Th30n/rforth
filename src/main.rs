@@ -271,6 +271,10 @@ impl DataSpace {
         self.memory.ptr as usize + self.size()
     }
 
+    pub fn here(&self) -> usize {
+        self.memory.current as usize
+    }
+
     pub fn unused(&self) -> usize {
         self.memory.unused()
     }
@@ -346,10 +350,7 @@ impl DataSpace {
     }
 
     pub fn is_builtin_addr(&self, addr: usize) -> bool {
-        self.builtin_addrs
-            .iter()
-            .find(|(a, _)| *a == addr)
-            .is_some()
+        self.builtin_addrs.iter().any(|(a, _)| *a == addr)
     }
 
     pub fn push_builtin_word(&mut self, name: &str, flags: usize, word_fn: fn(&mut ForthMachine)) {
@@ -523,15 +524,19 @@ const BLANK_CHARS: [char; 3] = [' ', '\t', '\n'];
 
 fn do_word_builtin(forth: &mut ForthMachine) -> Option<()> {
     let mut byte = read_stdin_byte(forth).unwrap()?;
-    // Skip comment until newline
-    if byte == b'\\' {
-        while byte != b'\n' {
+    loop {
+        // Skip blanks
+        while BLANK_CHARS.contains(&byte.into()) {
             byte = read_stdin_byte(forth).unwrap()?;
         }
-    }
-    // Skip blanks
-    while BLANK_CHARS.contains(&byte.into()) {
-        byte = read_stdin_byte(forth).unwrap()?;
+        // Skip comment until newline
+        if byte == b'\\' {
+            while byte != b'\n' {
+                byte = read_stdin_byte(forth).unwrap()?;
+            }
+        } else {
+            break;
+        }
     }
     let mut word_buffer_ix = 0;
     while !BLANK_CHARS.contains(&byte.into()) {
@@ -641,13 +646,7 @@ fn hidden_builtin(forth: &mut ForthMachine) {
 }
 
 fn immediate_builtin(forth: &mut ForthMachine) {
-    let ptr = forth.data_stack.pop().unwrap() as *const u8;
-    let ptr = unsafe { ptr.as_ref() }.unwrap();
-    let mut dict_entry_ref = DictEntryRef {
-        data_space: &forth.data_space,
-        ptr,
-    };
-    dict_entry_ref.toggle_immediate();
+    forth.data_space.latest_entry().unwrap().toggle_immediate();
 }
 
 fn branch_builtin(forth: &mut ForthMachine) {
@@ -752,6 +751,31 @@ fn rs_clear_builtin(forth: &mut ForthMachine) {
     forth.return_stack.clear();
 }
 
+fn tick_builtin(forth: &mut ForthMachine) {
+    let ptr_to_def_addr = forth.instruction_addr as *const isize;
+    assert!(forth.data_space.is_valid_ptr(ptr_to_def_addr));
+    let def_addr = unsafe { *ptr_to_def_addr };
+    forth.instruction_addr = forth.instruction_addr.checked_add(PTR_SIZE).unwrap();
+    forth.data_stack.push(def_addr);
+}
+
+fn execute_builtin(forth: &mut ForthMachine) {
+    let def_addr = forth.data_stack.pop().unwrap() as usize;
+    exec_fun_indirect(def_addr, forth);
+}
+
+fn here_builtin(forth: &mut ForthMachine) {
+    // TODO: Make this put HERE variable address on stack.
+    // Now it behaves like a constant.
+    forth.data_stack.push(forth.data_space.here() as isize);
+}
+
+fn sub_builtin(forth: &mut ForthMachine) {
+    let b = forth.data_stack.pop().unwrap();
+    let a = forth.data_stack.last_mut().unwrap();
+    *a = a.wrapping_sub(b);
+}
+
 fn add_builtins(data_space: &mut DataSpace) {
     data_space.push_builtin_word("BYE", 0, bye_builtin);
     data_space.push_builtin_word("DROP", 0, drop_builtin);
@@ -778,6 +802,10 @@ fn add_builtins(data_space: &mut DataSpace) {
     data_space.push_builtin_word("]", 0, rbrac_builtin);
     data_space.push_builtin_word("INTERPRET", 0, interpret_builtin);
     data_space.push_builtin_word("RS-CLEAR", 0, rs_clear_builtin);
+    data_space.push_builtin_word("'", 0, tick_builtin);
+    data_space.push_builtin_word("HERE", 0, here_builtin);
+    data_space.push_builtin_word("-", 0, sub_builtin);
+    data_space.push_builtin_word("EXECUTE", 0, execute_builtin);
 }
 
 fn exec_fun_indirect(addr: usize, forth: &mut ForthMachine) {
@@ -911,7 +939,15 @@ fn fmt_memsize(bytes: usize) -> String {
 
 #[derive(Parser)]
 #[command(name = "rForth")]
-#[command(about = "Simple Forth Virtual Machine")]
+/// Simple Forth Virtual Machine
+///
+/// To pass a forth source code file, invoke with
+///
+///     $ cat FORTH_FILE | rforth
+///
+/// If you want to continue running the interpreter, use
+///
+///     $ cat FORTH_FILE - | rforth
 struct CliArgs {
     /// Size of total memory used for Forth's data space.
     ///
