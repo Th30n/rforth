@@ -133,7 +133,15 @@ enum WordFlag {
 /// Entry in a Forth dictionary
 ///
 /// Memory layout of a dict entry is the following.
-/// | prev: ptr | flags: usize | len: usize | name: bytes | padding | definition...
+///
+/// | prev: ptr | flags: usize | len: usize | name: bytes | pad | definition...
+///
+/// Definition list consists of | codeword | definition addr...
+///
+/// The codeword is the native address to a function, so we call that directly.
+/// It is either a `docol` or some of the `*_builtin` functions.
+/// Remaining `definition addr` are pointers to the start of a `definition` in
+/// some other dict entry, i.e. word.
 #[derive(Copy, Clone)]
 struct DictEntryRef<'a> {
     data_space: &'a DataSpace,
@@ -245,7 +253,8 @@ struct DataSpace {
 
 impl DataSpace {
     pub fn with_size(bytes: usize) -> Self {
-        let builtin_addrs = Vec::with_capacity(64);
+        let mut builtin_addrs = Vec::with_capacity(64);
+        builtin_addrs.push((docol as usize, "DOCOL".to_string()));
         DataSpace {
             memory: Memory::with_size(bytes),
             dict_head: std::ptr::null(),
@@ -467,7 +476,10 @@ fn swap_builtin(forth: &mut ForthMachine) {
     forth.data_stack.push(b);
 }
 
-fn docol_builtin(forth: &mut ForthMachine) {
+// DOCOL is special, it is a codeword and as such its direct address should be
+// used when creating new words.
+// TODO: Maybe make a DOCOL word (constant) that pushes this address on stack.
+fn docol(forth: &mut ForthMachine) {
     forth.return_stack.push(forth.instruction_addr as isize);
     forth.instruction_addr = forth.curr_def_addr.checked_add(PTR_SIZE).unwrap();
 }
@@ -665,7 +677,7 @@ fn lit_builtin(forth: &mut ForthMachine) {
     let ptr_to_val = forth.instruction_addr as *const isize;
     assert!(forth.data_space.is_valid_ptr(ptr_to_val));
     let val = unsafe { *ptr_to_val };
-    println!("val: {:#x}", val);
+    // println!("val: {:#x}", val);
     forth.instruction_addr = forth.instruction_addr.checked_add(PTR_SIZE).unwrap();
     forth.data_stack.push(val);
 }
@@ -708,22 +720,28 @@ fn interpret_builtin(forth: &mut ForthMachine) {
     let bytes = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
     let name = std::str::from_utf8(bytes).unwrap();
     if let Some(dict_entry_ref) = forth.data_space.find_entry(name) {
-        dbg!(dict_entry_ref);
+        // dbg!(dict_entry_ref);
         if dict_entry_ref.is_immediate() || forth.state == ForthState::Immediate {
             exec_fun_indirect(dict_entry_ref.definition_addr(), forth);
         } else {
             // Compiling
             let def_addr = dict_entry_ref.definition_addr();
-            let def_addr = unsafe { *(def_addr as *const usize) };
             push_instruction(&mut forth.data_space, def_addr);
         }
     } else {
         // TODO: Use BASE variable for parsing.
-        let num: isize = name.parse().unwrap();
+        let num: isize = name
+            .parse()
+            .unwrap_or_else(|_| panic!("Unable to parse '{}' as number", name));
         match forth.state {
             ForthState::Immediate => forth.data_stack.push(num),
             ForthState::Compile => {
-                push_instruction(&mut forth.data_space, lit_builtin as usize);
+                let lit = forth
+                    .data_space
+                    .find_entry("LIT")
+                    .unwrap()
+                    .definition_addr();
+                push_instruction(&mut forth.data_space, lit);
                 push_instruction(&mut forth.data_space, num as usize);
             }
         }
@@ -735,7 +753,6 @@ fn rs_clear_builtin(forth: &mut ForthMachine) {
 }
 
 fn add_builtins(data_space: &mut DataSpace) {
-    data_space.push_builtin_word("DOCOL", 0, docol_builtin);
     data_space.push_builtin_word("BYE", 0, bye_builtin);
     data_space.push_builtin_word("DROP", 0, drop_builtin);
     data_space.push_builtin_word("DUP", 0, dup_builtin);
@@ -765,7 +782,7 @@ fn add_builtins(data_space: &mut DataSpace) {
 
 fn exec_fun_indirect(addr: usize, forth: &mut ForthMachine) {
     forth.curr_def_addr = addr;
-    println!("forth.curr_def_addr: {:#x}", forth.curr_def_addr);
+    // println!("forth.curr_def_addr: {:#x}", forth.curr_def_addr);
     assert!(
         forth.data_space.is_valid_ptr(addr as *const usize),
         "'{addr:#x} ({addr})' is not a valid ptr",
@@ -777,10 +794,11 @@ fn exec_fun_indirect(addr: usize, forth: &mut ForthMachine) {
         .builtin_addrs
         .iter()
         .find(|(a, _)| *a == fun_addr);
-    match maybe_builtin {
-        None => println!("Executing fun at {:#x}", fun_addr),
-        Some((_, name)) => println!("Executing '{}' ({:#x})", name, fun_addr),
-    }
+    // TODO: Setup debugging & tracing facilities.
+    // match maybe_builtin {
+    //     None => println!("Executing fun at {:#x}", fun_addr),
+    //     Some((_, name)) => println!("Executing '{}' ({:#x})", name, fun_addr),
+    // }
     assert!(maybe_builtin.is_some());
     let fun: fn(&mut ForthMachine) = unsafe { std::mem::transmute(fun_addr as *const u8) };
     fun(forth)
@@ -793,8 +811,7 @@ fn next(forth: &mut ForthMachine) {
     assert!(forth
         .data_space
         .is_valid_ptr(forth.instruction_addr as *const usize));
-    // let def_addr = unsafe { *(forth.instruction_addr as *const usize) };
-    let def_addr = forth.instruction_addr;
+    let def_addr = unsafe { *(forth.instruction_addr as *const usize) };
     forth.instruction_addr = forth.instruction_addr.checked_add(PTR_SIZE).unwrap();
     // println!("curr_def_addr at {:#x}", def_addr);
     // println!("instruction_addr at {:#x}", forth.instruction_addr);
@@ -814,12 +831,11 @@ where
     I: IntoIterator<Item = &'a str>,
 {
     assert!(data_space.push_dict_entry(name, flags));
-    push_instruction(data_space, docol_builtin as usize);
+    push_instruction(data_space, docol as usize);
     for word in words {
         match data_space.find_entry(word) {
             Some(entry) => {
-                let def_addr = unsafe { *(entry.definition_addr() as *const usize) };
-                push_instruction(data_space, def_addr);
+                push_instruction(data_space, entry.definition_addr());
             }
             None => {
                 let num: isize = word.parse().unwrap();
@@ -832,7 +848,6 @@ where
         };
     }
     let def_addr = data_space.find_entry("EXIT").unwrap().definition_addr();
-    let def_addr = unsafe { *(def_addr as *const usize) };
     push_instruction(data_space, def_addr);
 }
 
@@ -843,13 +858,9 @@ where
     assert!(forth.data_space.align());
     for word in words {
         let def_addr = forth.data_space.find_entry(word).unwrap().definition_addr();
-        {
-            let def_addr = unsafe { *(def_addr as *const usize) };
-            let instruction_addr = push_instruction(&mut forth.data_space, def_addr);
-        }
+        let instruction_addr = push_instruction(&mut forth.data_space, def_addr);
         if forth.instruction_addr == 0 {
-            // forth.instruction_addr = instruction_addr;
-            forth.instruction_addr = def_addr;
+            forth.instruction_addr = instruction_addr;
         }
     }
     let def_addr = forth
@@ -857,7 +868,6 @@ where
         .find_entry("BYE")
         .unwrap()
         .definition_addr();
-    let def_addr = unsafe { *(def_addr as *const usize) };
     push_instruction(&mut forth.data_space, def_addr);
 }
 
@@ -936,7 +946,14 @@ fn main() {
         ":",
         0,
         [
-            "WORD", "CREATE", "LIT", "DOCOL", ",", "LATEST", /* "@", */ "HIDDEN", "]",
+            "WORD",
+            "CREATE",
+            "LIT",
+            &(docol as usize).to_string(),
+            ",",
+            "LATEST",
+            /* "@", */ "HIDDEN",
+            "]",
         ],
     );
     push_word(
@@ -951,12 +968,7 @@ fn main() {
         0,
         ["RS-CLEAR", "INTERPRET", "BRANCH", "-16"],
     );
-    // set_instructions(&mut forth, ["QUIT"]);
-    forth.instruction_addr = forth
-        .data_space
-        .find_entry("QUIT")
-        .unwrap()
-        .definition_addr();
+    set_instructions(&mut forth, ["QUIT"]);
     while forth.instruction_addr != 0 {
         next(&mut forth);
     }
