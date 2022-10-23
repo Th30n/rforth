@@ -39,6 +39,11 @@
 \ Emit carriage return (\n here).
 : CR  10 EMIT ;
 
+\ CONTROL STRUCTURES
+\ ==================
+\ These only work inside compiled words. Typing in immediate mode (as presented
+\ by the interpreter) will result in an error.
+
 : IF IMMEDIATE
     ['] 0BRANCH , \ compile 0BRANCH
     HERE \ @    \ save location of the offset on stack
