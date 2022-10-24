@@ -1,14 +1,15 @@
 : TRUE  -1 ;
 : FALSE 0 ;
 
+\ Put execution token (xt) on stack; parses at run-time
+\ For parsing during compile-time use word [']
+: ' WORD FIND >CFA ;
+
 \ Put execution token (xt) on stack; parses at compile-time
 \ For parsing during run-time use word '
 : ['] IMMEDIATE
-  ' LIT ,
+    LIT LIT ,
 ;
-
-\ Overwrite original ' to now parse at run-time.
-: ' WORD FIND >CFA ;
 
 \ Compile a `word` that would otherwise be IMMEDIATE.
 : [COMPILE] IMMEDIATE

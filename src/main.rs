@@ -796,14 +796,6 @@ fn rs_clear_builtin(forth: &mut ForthMachine) {
     forth.return_stack.clear();
 }
 
-fn tick_builtin(forth: &mut ForthMachine) {
-    let ptr_to_def_addr = forth.instruction_addr as *const isize;
-    assert!(forth.data_space.is_valid_ptr(ptr_to_def_addr));
-    let def_addr = unsafe { *ptr_to_def_addr };
-    forth.instruction_addr = forth.instruction_addr.checked_add(PTR_SIZE).unwrap();
-    forth.data_stack.push(def_addr);
-}
-
 fn execute_builtin(forth: &mut ForthMachine) {
     let def_addr = forth.data_stack.pop().unwrap() as usize;
     exec_fun_indirect(def_addr, forth);
@@ -853,7 +845,6 @@ fn add_builtins(data_space: &mut DataSpace) {
     data_space.push_builtin_word("]", 0, rbrac_builtin);
     data_space.push_builtin_word("INTERPRET", 0, interpret_builtin);
     data_space.push_builtin_word("RS-CLEAR", 0, rs_clear_builtin);
-    data_space.push_builtin_word("'", 0, tick_builtin);
     data_space.push_builtin_word("HERE", 0, here_builtin);
     data_space.push_builtin_word("UNUSED", 0, unused_builtin);
     data_space.push_builtin_word("-", 0, sub_builtin);
