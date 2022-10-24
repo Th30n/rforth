@@ -142,8 +142,15 @@ fn test_memory_align() {
     assert_eq!(memory.unused(), 1024 - 16 - 8);
 }
 
+/// Size of buffer for WORD word, as well as the maximum length of a name
+/// string for a dict entry, i.e. word.
+const WORD_BUFFER_SIZE: usize = 32;
+// Mask for fitting WORD_BUFFER_SIZE, though this could fit up to 63 bytes.
+const DICT_ENTRY_LEN_MASK: u8 = 0x3f;
+// Flags must not overlap with the len mask.
+#[repr(u8)]
 enum WordFlag {
-    Hidden = 0x20,
+    Hidden = 0x40,
     Immediate = 0x80,
 }
 
@@ -151,7 +158,7 @@ enum WordFlag {
 ///
 /// Memory layout of a dict entry is the following.
 ///
-/// | prev: ptr | flags: usize | len: usize | name: bytes | pad | definition...
+/// | prev: ptr | flags|len: u8 | name: bytes | pad | definition...
 ///
 /// Definition list consists of | codeword | definition addr...
 ///
@@ -197,21 +204,28 @@ impl<'a> DictEntryRef<'a> {
         }
     }
 
-    pub fn flags(&self) -> usize {
-        let flags_buf = &self.ptr_as_slice()[PTR_SIZE..][..PTR_SIZE];
-        usize::from_ne_bytes(<[u8; PTR_SIZE]>::try_from(flags_buf).unwrap())
+    fn flags_and_name_len(&self) -> u8 {
+        self.ptr_as_slice()[PTR_SIZE..][0]
     }
 
-    fn set_flags(&mut self, flags: usize) {
-        let flags_buf = &mut self.ptr_as_slice_mut()[PTR_SIZE..][..PTR_SIZE];
-        let mut cursor = std::io::Cursor::new(flags_buf);
-        cursor.write_all(&flags.to_ne_bytes()).unwrap();
+    fn name_len(&self) -> u8 {
+        self.flags_and_name_len() & DICT_ENTRY_LEN_MASK
+    }
+
+    pub fn flags(&self) -> u8 {
+        self.flags_and_name_len() & !DICT_ENTRY_LEN_MASK
+    }
+
+    fn set_flags(&mut self, flags: u8) {
+        assert_eq!(flags & DICT_ENTRY_LEN_MASK, 0);
+        self.ptr_as_slice_mut()[PTR_SIZE..][0] = self.name_len() | flags;
     }
 
     pub fn name(&self) -> &str {
-        let (len_buf, name_buf) = self.ptr_as_slice()[2 * PTR_SIZE..].split_at(PTR_SIZE);
-        let len = usize::from_ne_bytes(<[u8; PTR_SIZE]>::try_from(len_buf).unwrap());
-        std::str::from_utf8(&name_buf[0..len]).unwrap()
+        let len = self.name_len() as usize;
+        // name_buf is after prev ptr and flags|len byte.
+        let name_buf = &self.ptr_as_slice()[PTR_SIZE + 1..][..len];
+        std::str::from_utf8(name_buf).unwrap()
     }
 
     pub fn definition_addr(&self) -> usize {
@@ -222,24 +236,24 @@ impl<'a> DictEntryRef<'a> {
 
     // Return true if now hidden.
     pub fn toggle_hidden(&mut self) -> bool {
-        let new_flags = self.flags() ^ WordFlag::Hidden as usize;
+        let new_flags = self.flags() ^ WordFlag::Hidden as u8;
         self.set_flags(new_flags);
         self.is_hidden()
     }
 
     pub fn is_hidden(&self) -> bool {
-        (self.flags() & WordFlag::Hidden as usize) != 0
+        (self.flags() & WordFlag::Hidden as u8) != 0
     }
 
     // Return true if now immediate.
     pub fn toggle_immediate(&mut self) -> bool {
-        let new_flags = self.flags() ^ WordFlag::Immediate as usize;
+        let new_flags = self.flags() ^ WordFlag::Immediate as u8;
         self.set_flags(new_flags);
         self.is_immediate()
     }
 
     pub fn is_immediate(&self) -> bool {
-        (self.flags() & WordFlag::Immediate as usize) != 0
+        (self.flags() & WordFlag::Immediate as u8) != 0
     }
 }
 
@@ -320,17 +334,19 @@ impl DataSpace {
     /// Allocate a new entry in the dictionary with given `name`.
     /// The entry is padded, so that the next allocation is aligned.
     #[must_use]
-    pub fn push_dict_entry(&mut self, name: &str, flags: usize) -> bool {
+    pub fn push_dict_entry(&mut self, name: &str, flags: u8) -> bool {
+        assert_eq!(flags & DICT_ENTRY_LEN_MASK, 0);
+        assert!(name.len() <= WORD_BUFFER_SIZE);
         let prev_addr = self.dict_head as usize;
-        let entry_size = PTR_SIZE + PTR_SIZE + PTR_SIZE + name.len();
+        let entry_size = PTR_SIZE +  1 + name.len();
         match self.alloc(entry_size) {
             None => false,
             Some(entry_ptr) => {
                 let buf = unsafe { std::slice::from_raw_parts_mut(entry_ptr, entry_size) };
                 let mut cursor = std::io::Cursor::new(buf);
                 cursor.write_all(&prev_addr.to_ne_bytes()).unwrap();
-                cursor.write_all(&flags.to_ne_bytes()).unwrap();
-                cursor.write_all(&name.len().to_ne_bytes()).unwrap();
+                let flags_and_name_len = flags | (name.len() as u8);
+                cursor.write_all(&[flags_and_name_len]).unwrap();
                 cursor.write_all(name.as_bytes()).unwrap();
                 if !self.align() {
                     assert!(self.dealloc(entry_size));
@@ -371,7 +387,7 @@ impl DataSpace {
         self.builtin_addrs.iter().any(|(a, _)| *a == addr)
     }
 
-    pub fn push_builtin_word(&mut self, name: &str, flags: usize, word_fn: fn(&mut ForthMachine)) {
+    pub fn push_builtin_word(&mut self, name: &str, flags: u8, word_fn: fn(&mut ForthMachine)) {
         assert!(self.push_dict_entry(name, flags));
         let fn_addr = word_fn as usize;
         if !self.is_builtin_addr(fn_addr) {
@@ -422,7 +438,6 @@ fn test_data_space_find_entry() {
 const FORTH_TRUE: isize = -1;
 const FORTH_FALSE: isize = 0;
 const INPUT_BUFFER_SIZE: usize = 4096;
-const WORD_BUFFER_SIZE: usize = 32;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum ForthState {
@@ -800,6 +815,10 @@ fn here_builtin(forth: &mut ForthMachine) {
     forth.data_stack.push(forth.data_space.here() as isize);
 }
 
+fn unused_builtin(forth: &mut ForthMachine) {
+    forth.data_stack.push(forth.data_space.unused() as isize);
+}
+
 fn sub_builtin(forth: &mut ForthMachine) {
     let b = forth.data_stack.pop().unwrap();
     let a = forth.data_stack.last_mut().unwrap();
@@ -824,18 +843,19 @@ fn add_builtins(data_space: &mut DataSpace) {
     data_space.push_builtin_word("LATEST", 0, latest_builtin);
     data_space.push_builtin_word(">CFA", 0, to_cfa_builtin);
     data_space.push_builtin_word("HIDDEN", 0, hidden_builtin);
-    data_space.push_builtin_word("IMMEDIATE", WordFlag::Immediate as usize, immediate_builtin);
+    data_space.push_builtin_word("IMMEDIATE", WordFlag::Immediate as u8, immediate_builtin);
     data_space.push_builtin_word("BRANCH", 0, branch_builtin);
     data_space.push_builtin_word("0BRANCH", 0, zbranch_builtin);
     data_space.push_builtin_word("LIT", 0, lit_builtin);
     data_space.push_builtin_word("CREATE", 0, create_builtin);
     data_space.push_builtin_word(",", 0, comma_builtin);
-    data_space.push_builtin_word("[", WordFlag::Immediate as usize, lbrac_builtin);
+    data_space.push_builtin_word("[", WordFlag::Immediate as u8, lbrac_builtin);
     data_space.push_builtin_word("]", 0, rbrac_builtin);
     data_space.push_builtin_word("INTERPRET", 0, interpret_builtin);
     data_space.push_builtin_word("RS-CLEAR", 0, rs_clear_builtin);
     data_space.push_builtin_word("'", 0, tick_builtin);
     data_space.push_builtin_word("HERE", 0, here_builtin);
+    data_space.push_builtin_word("UNUSED", 0, unused_builtin);
     data_space.push_builtin_word("-", 0, sub_builtin);
     data_space.push_builtin_word("EXECUTE", 0, execute_builtin);
 }
@@ -887,7 +907,7 @@ fn push_instruction(data_space: &mut DataSpace, def_addr: usize) -> usize {
     cursor.into_inner().as_ptr() as usize
 }
 
-fn push_word<'a, I>(data_space: &mut DataSpace, name: &str, flags: usize, words: I)
+fn push_word<'a, I>(data_space: &mut DataSpace, name: &str, flags: u8, words: I)
 where
     I: IntoIterator<Item = &'a str>,
 {
@@ -1028,7 +1048,7 @@ fn main() {
     push_word(
         &mut forth.data_space,
         ";",
-        WordFlag::Immediate as usize,
+        WordFlag::Immediate as u8,
         ["LIT", "EXIT", ",", "LATEST", /* "@", */ "HIDDEN", "["],
     );
     push_word(
@@ -1038,6 +1058,7 @@ fn main() {
         ["RS-CLEAR", "INTERPRET", "BRANCH", "-16"],
     );
     set_instructions(&mut forth, ["QUIT"]);
+    println!("unused {} bytes", fmt_memsize(forth.data_space.unused()));
     while forth.instruction_addr != 0 {
         next(&mut forth);
     }
