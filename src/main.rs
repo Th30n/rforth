@@ -163,7 +163,7 @@ enum WordFlag {
 /// Definition list consists of | codeword | definition addr...
 ///
 /// The codeword is the native address to a function, so we call that directly.
-/// It is either a `docol` or some of the `*_builtin` functions.
+/// It is either a `docol`, `docreate` or some of the `*_builtin` functions.
 /// Remaining `definition addr` are pointers to the start of a `definition` in
 /// some other dict entry, i.e. word.
 #[derive(Copy, Clone)]
@@ -286,6 +286,7 @@ impl DataSpace {
     pub fn with_size(bytes: usize) -> Self {
         let mut builtin_addrs = Vec::with_capacity(64);
         builtin_addrs.push((docol as usize, "DOCOL".to_string()));
+        builtin_addrs.push((docreate as usize, "DOCREATE".to_string()));
         DataSpace {
             memory: Memory::with_size(bytes),
             dict_head: std::ptr::null_mut(),
@@ -338,7 +339,7 @@ impl DataSpace {
         assert_eq!(flags & DICT_ENTRY_LEN_MASK, 0);
         assert!(name.len() <= WORD_BUFFER_SIZE);
         let prev_addr = self.dict_head as usize;
-        let entry_size = PTR_SIZE +  1 + name.len();
+        let entry_size = PTR_SIZE + 1 + name.len();
         match self.alloc(entry_size) {
             None => false,
             Some(entry_ptr) => {
@@ -726,7 +727,25 @@ fn lit_builtin(forth: &mut ForthMachine) {
     forth.data_stack.push(val);
 }
 
+fn allot_builtin(forth: &mut ForthMachine) {
+    let bytes = forth.data_stack.pop().unwrap();
+    if bytes > 0 {
+        forth.data_space.alloc(bytes as usize).unwrap();
+    } else if bytes < 0 {
+        assert!(forth.data_space.dealloc(bytes.unsigned_abs()));
+    }
+}
+
+// `CREATE` is a bit special, it will allocate a dict entry, but will set the
+// codeword to be `docreate` and append a `ptr` for runtime semantics of the
+// newly created word. This ptr is set to 0 initially, but can be overwritten
+// with `DOES>`. What follows the allocated dict entry is the space for data
+// fields. This address can be obtained via `BODY>`.
+// NOTE: DOES> is implemented in rforth.fs
 fn create_builtin(forth: &mut ForthMachine) {
+    if do_word_builtin(forth).is_none() {
+        return bye_builtin(forth);
+    }
     let byte_len = forth.data_stack.pop().unwrap() as usize;
     let ptr = forth.data_stack.pop().unwrap() as *const u8;
     assert!(forth.data_space.is_valid_ptr(ptr));
@@ -735,7 +754,37 @@ fn create_builtin(forth: &mut ForthMachine) {
         .is_valid_ptr((ptr as usize + byte_len - 1) as *const u8));
     let bytes = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
     let name = std::str::from_utf8(bytes).unwrap();
+    // println!("Pushing '{}' to dict", name);
     assert!(forth.data_space.push_dict_entry(name, 0));
+    push_instruction(&mut forth.data_space, docreate as usize);
+    push_instruction(&mut forth.data_space, 0);
+}
+
+// DOCREATE is a special codeword, it will push the address of the start of the
+// dict entry's data fields on the data stack. If the `ptr` after the codeword
+// is not 0, it will then set the next instruction to be found at that `ptr`.
+// This way we implement run-time semantics of a CREATEd word that has DOES>.
+fn docreate(forth: &mut ForthMachine) {
+    assert!(
+        forth
+            .data_space
+            .is_valid_ptr(forth.curr_def_addr as *const usize),
+        "'{addr:#x} ({addr})' is not a valid ptr",
+        addr = forth.curr_def_addr,
+    );
+    let fun_addr = unsafe { *(forth.curr_def_addr as *const usize) };
+    // Sanity check that forth.curr_def_addr is indeed the dict entry we are
+    // executing in.
+    assert_eq!(fun_addr, docreate as usize);
+    let instr_addr_ptr = forth.curr_def_addr.checked_add(PTR_SIZE).unwrap() as *const usize;
+    assert!(forth.data_space.is_valid_ptr(instr_addr_ptr));
+    let data_addr = (instr_addr_ptr as usize).checked_add(PTR_SIZE).unwrap();
+    forth.data_stack.push(data_addr as isize);
+    let instr_addr = unsafe { *instr_addr_ptr };
+    if instr_addr != 0 {
+        forth.return_stack.push(forth.instruction_addr as isize);
+        forth.instruction_addr = instr_addr;
+    }
 }
 
 fn comma_builtin(forth: &mut ForthMachine) {
@@ -802,13 +851,26 @@ fn execute_builtin(forth: &mut ForthMachine) {
 }
 
 fn here_builtin(forth: &mut ForthMachine) {
-    // TODO: Make this put HERE variable address on stack.
-    // Now it behaves like a constant.
     forth.data_stack.push(forth.data_space.here() as isize);
+}
+
+fn align_builtin(forth: &mut ForthMachine) {
+    assert!(forth.data_space.align());
 }
 
 fn unused_builtin(forth: &mut ForthMachine) {
     forth.data_stack.push(forth.data_space.unused() as isize);
+}
+
+fn cells_builtin(forth: &mut ForthMachine) {
+    let n = forth.data_stack.pop().unwrap();
+    forth.data_stack.push(n.wrapping_mul(PTR_SIZE as isize))
+}
+
+fn add_builtin(forth: &mut ForthMachine) {
+    let b = forth.data_stack.pop().unwrap();
+    let a = forth.data_stack.last_mut().unwrap();
+    *a = a.wrapping_add(b);
 }
 
 fn sub_builtin(forth: &mut ForthMachine) {
@@ -839,14 +901,18 @@ fn add_builtins(data_space: &mut DataSpace) {
     data_space.push_builtin_word("BRANCH", 0, branch_builtin);
     data_space.push_builtin_word("0BRANCH", 0, zbranch_builtin);
     data_space.push_builtin_word("LIT", 0, lit_builtin);
+    data_space.push_builtin_word("ALLOT", 0, allot_builtin);
     data_space.push_builtin_word("CREATE", 0, create_builtin);
     data_space.push_builtin_word(",", 0, comma_builtin);
     data_space.push_builtin_word("[", WordFlag::Immediate as u8, lbrac_builtin);
     data_space.push_builtin_word("]", 0, rbrac_builtin);
     data_space.push_builtin_word("INTERPRET", 0, interpret_builtin);
     data_space.push_builtin_word("RS-CLEAR", 0, rs_clear_builtin);
+    data_space.push_builtin_word("ALIGN", 0, align_builtin);
     data_space.push_builtin_word("HERE", 0, here_builtin);
     data_space.push_builtin_word("UNUSED", 0, unused_builtin);
+    data_space.push_builtin_word("CELLS", 0, cells_builtin);
+    data_space.push_builtin_word("+", 0, add_builtin);
     data_space.push_builtin_word("-", 0, sub_builtin);
     data_space.push_builtin_word("EXECUTE", 0, execute_builtin);
 }
@@ -1026,11 +1092,15 @@ fn main() {
         ":",
         0,
         [
-            "WORD",
-            "CREATE",
+            "CREATE", // This will push `docreate` as codeword, and 0 ptr.
+            "LIT",
+            &(-(PTR_SIZE as isize)).to_string(),
+            "ALLOT", // Deallocate the 0 ptr.
             "LIT",
             &(docol as usize).to_string(),
-            ",",
+            "LATEST", /* "@" */
+            ">CFA",
+            "!", // Overwrite `docreate` codeword with docol
             "LATEST",
             /* "@", */ "HIDDEN",
             "]",

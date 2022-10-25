@@ -1,6 +1,3 @@
-: TRUE  -1 ;
-: FALSE 0 ;
-
 \ Put execution token (xt) on stack; parses at run-time
 \ For parsing during compile-time use word [']
 : ' WORD FIND >CFA ;
@@ -21,6 +18,31 @@
     ['] LIT , \ compile LIT
     ,         \ compile `val` from stack
 ;
+
+: CELL+ 1 CELLS + ;
+
+\ DOES> will modify the latest CREATEd word.
+\ It can be only used in a colon definition.
+: DOES> IMMEDIATE
+    ['] LIT ,     \ compile LIT
+    HERE          \ save location where we will store ptr to words after DOES>
+    0 ,           \ store dummy 0 as ptr
+    ['] LATEST ,  \ compile LATEST
+    ['] >CFA ,    \ compile >CFA
+    ['] CELL+ ,   \ compile skipping over the codeword to ptr for `docreate`
+    ['] ! ,       \ compile overwriting ptr with HERE
+    ['] EXIT ,    \ compile EXIT to skip out of executing words after DOES>
+    HERE SWAP !   \ backfill the ptr with location of words after DOES>
+;
+
+: CONSTANT
+    CREATE ,
+DOES>
+    @
+;
+
+-1 CONSTANT TRUE
+0 CONSTANT FALSE
 
 \ Read a word and put the first character on stack.
 : CHAR
