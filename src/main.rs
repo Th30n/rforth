@@ -740,8 +740,8 @@ fn allot_builtin(forth: &mut ForthMachine) {
 // codeword to be `docreate` and append a `ptr` for runtime semantics of the
 // newly created word. This ptr is set to 0 initially, but can be overwritten
 // with `DOES>`. What follows the allocated dict entry is the space for data
-// fields. This address can be obtained via `BODY>`.
-// NOTE: DOES> is implemented in rforth.fs
+// fields. This address can be obtained via `>BODY`.
+// NOTE: `DOES>` & `>BODY` are implemented in rforth.fs
 fn create_builtin(forth: &mut ForthMachine) {
     if do_word_builtin(forth).is_none() {
         return bye_builtin(forth);

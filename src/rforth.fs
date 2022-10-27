@@ -1,6 +1,6 @@
 \ Put execution token (xt) on stack; parses at run-time
 \ For parsing during compile-time use word [']
-: ' WORD FIND >CFA ;
+: '  WORD FIND >CFA ;
 
 \ Put execution token (xt) on stack; parses at compile-time
 \ For parsing during run-time use word '
@@ -19,7 +19,7 @@
     ,         \ compile `val` from stack
 ;
 
-: CELL+ 1 CELLS + ;
+: CELL+  1 CELLS + ;
 
 \ DOES> will modify the latest CREATEd word.
 \ It can be only used in a colon definition.
@@ -34,6 +34,9 @@
     ['] EXIT ,    \ compile EXIT to skip out of executing words after DOES>
     HERE SWAP !   \ backfill the ptr with location of words after DOES>
 ;
+
+\ Get data field address from an execution token
+: >BODY  2 CELLS + ;
 
 : CONSTANT
     CREATE ,
@@ -57,7 +60,7 @@ DOES>
 \ Put blank (space) on stack.
 : BL  32 ;
 
-: SPACE BL EMIT ;
+: SPACE  BL EMIT ;
 
 \ Emit carriage return (\n here).
 : CR  10 EMIT ;
