@@ -692,23 +692,36 @@ fn emit_builtin(forth: &mut ForthMachine) {
     assert_eq!(std::io::stdout().write(&[v]).unwrap(), 1);
 }
 
-const BLANK_CHARS: [char; 3] = [' ', '\t', '\n'];
-
-fn do_word_builtin(forth: &mut ForthMachine) -> Option<()> {
-    let mut byte = read_stdin_byte(forth).unwrap()?;
-    loop {
-        // Skip blanks
-        while BLANK_CHARS.contains(&byte.into()) {
+// ( "ccc<eol>" -- )
+// Parses and discards \ comments
+fn backslash_builtin(forth: &mut ForthMachine) {
+    let mut do_backslash = || -> Option<()> {
+        let mut byte = read_stdin_byte(forth).unwrap()?;
+        // Skip comment until newline or EOF
+        while byte != b'\n' {
             byte = read_stdin_byte(forth).unwrap()?;
         }
-        // Skip comment until newline
-        if byte == b'\\' {
-            while byte != b'\n' {
-                byte = read_stdin_byte(forth).unwrap()?;
-            }
-        } else {
-            break;
-        }
+        Some(())
+    };
+    do_backslash();
+}
+
+const BLANK_CHARS: [char; 3] = [' ', '\t', '\n'];
+
+// ( "<spaces>name<space>" -- c-addr u )
+//
+// Skip leading white space and parse `name` delimited by a white space.
+// NOTE: Behaves like standard PARSE-NAME, not like WORD.
+fn word_builtin(forth: &mut ForthMachine) {
+    if do_word_builtin(forth).is_none() {
+        bye_builtin(forth)
+    }
+}
+fn do_word_builtin(forth: &mut ForthMachine) -> Option<()> {
+    let mut byte = read_stdin_byte(forth).unwrap()?;
+    // Skip blanks
+    while BLANK_CHARS.contains(&byte.into()) {
+        byte = read_stdin_byte(forth).unwrap()?;
     }
     let mut word_buffer_ix = 0;
     while !BLANK_CHARS.contains(&byte.into()) {
@@ -721,12 +734,6 @@ fn do_word_builtin(forth: &mut ForthMachine) -> Option<()> {
     forth.data_stack().push(start_of_string_addr).unwrap();
     forth.data_stack().push(word_buffer_ix as isize).unwrap(); // len
     Some(())
-}
-
-fn word_builtin(forth: &mut ForthMachine) {
-    if do_word_builtin(forth).is_none() {
-        bye_builtin(forth)
-    }
 }
 
 fn store_builtin(forth: &mut ForthMachine) {
@@ -1054,7 +1061,7 @@ fn print_data_stack_builtin(forth: &mut ForthMachine) {
 const SPECIAL_CODEWORDS: [(&str, fn(&mut ForthMachine)); 2] =
     [("DOCOL", docol), ("DOCREATE", docreate)];
 
-const BUILTIN_WORDS: [(&str, u8, fn(&mut ForthMachine)); 39] = [
+const BUILTIN_WORDS: [(&str, u8, fn(&mut ForthMachine)); 40] = [
     ("BYE", 0, bye_builtin),
     ("DROP", 0, drop_builtin),
     ("DUP", 0, dup_builtin),
@@ -1062,6 +1069,7 @@ const BUILTIN_WORDS: [(&str, u8, fn(&mut ForthMachine)); 39] = [
     ("EXIT", 0, exit_builtin),
     ("KEY", 0, key_builtin),
     ("EMIT", 0, emit_builtin),
+    ("\\", WordFlag::Immediate as u8, backslash_builtin),
     ("WORD", 0, word_builtin),
     ("!", 0, store_builtin),
     ("@", 0, fetch_builtin),
