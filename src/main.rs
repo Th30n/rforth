@@ -1,5 +1,5 @@
 use clap::Parser;
-use std::convert::TryFrom;
+use std::convert::{TryFrom, TryInto};
 use std::io::{Read, Write};
 
 const PTR_SIZE: usize = std::mem::size_of::<usize>();
@@ -142,10 +142,9 @@ fn test_memory_align() {
     assert_eq!(memory.unused(), 1024 - 16 - 8);
 }
 
-/// Size of buffer for WORD word, as well as the maximum length of a name
-/// string for a dict entry, i.e. word.
-const WORD_BUFFER_SIZE: usize = 32;
-// Mask for fitting WORD_BUFFER_SIZE, though this could fit up to 63 bytes.
+/// Size of the buffer for WORD word. The first byte is used to track length.
+const WORD_BUFFER_SIZE: usize = 64;
+// Mask for fitting a dict entry's name length (up to 63 bytes).
 const DICT_ENTRY_LEN_MASK: u8 = 0x3f;
 // Flags must not overlap with the len mask.
 #[repr(u8)]
@@ -332,7 +331,7 @@ impl DataSpace {
     #[must_use]
     pub fn push_dict_entry(&mut self, name: &str, flags: u8) -> bool {
         assert_eq!(flags & DICT_ENTRY_LEN_MASK, 0);
-        assert!(name.len() <= WORD_BUFFER_SIZE);
+        assert!(name.len() <= DICT_ENTRY_LEN_MASK as usize);
         let prev_addr = self.dict_head as usize;
         let entry_size = PTR_SIZE + 1 + name.len();
         match self.alloc(entry_size) {
@@ -694,39 +693,69 @@ fn emit_builtin(forth: &mut ForthMachine) {
 
 const BLANK_CHARS: [char; 3] = [' ', '\t', '\n'];
 
-fn do_word_builtin(forth: &mut ForthMachine) -> Option<()> {
-    let mut byte = read_stdin_byte(forth).unwrap()?;
-    loop {
-        // Skip blanks
-        while BLANK_CHARS.contains(&byte.into()) {
+// ( "ccc<eol>" -- )
+// Parses and discards \ comments
+fn backslash_builtin(forth: &mut ForthMachine) {
+    let mut do_backslash = || -> Option<()> {
+        let mut byte = read_stdin_byte(forth).unwrap()?;
+        // Skip comment until newline or EOF
+        while byte != b'\n' {
             byte = read_stdin_byte(forth).unwrap()?;
         }
-        // Skip comment until newline
-        if byte == b'\\' {
-            while byte != b'\n' {
-                byte = read_stdin_byte(forth).unwrap()?;
-            }
-        } else {
-            break;
-        }
+        Some(())
+    };
+    do_backslash();
+}
+
+// ( char "<chars>ccc<char>" -- c-addr )
+//
+// Skip leading delimiters and parse characters `ccc` delimited by `char`.
+// Put the parsed string address as a counted string on stack (first byte is
+// the len, then characters follow).
+// NOTE: Using the space character (0x20) as the delimiter is treated as a
+// special case to mean any BLANK_CHARS can be delimiters.
+fn word_builtin(forth: &mut ForthMachine) {
+    let delimiter = forth.data_stack().pop().unwrap();
+    let delimiter = char::from_u32(delimiter.try_into().unwrap()).unwrap();
+    if do_word_builtin(forth, delimiter).is_none() {
+        bye_builtin(forth)
     }
-    let mut word_buffer_ix = 0;
-    while !BLANK_CHARS.contains(&byte.into()) {
-        assert!(word_buffer_ix < WORD_BUFFER_SIZE);
-        forth.word_buffer()[word_buffer_ix] = byte;
+}
+fn do_word_builtin(forth: &mut ForthMachine, delimiter: char) -> Option<()> {
+    let delimiter_is_blank = delimiter == ' ';
+    // TODO: Consider reading actual char instead of byte.
+    let mut byte = read_stdin_byte(forth).unwrap()?;
+    while delimiter == byte.into() || (delimiter_is_blank && BLANK_CHARS.contains(&byte.into())) {
         byte = read_stdin_byte(forth).unwrap()?;
-        word_buffer_ix += 1;
     }
+    assert!(WORD_BUFFER_SIZE <= u8::MAX as usize);
+    let mut word_len = 0;
+    while !(delimiter == byte.into() || (delimiter_is_blank && BLANK_CHARS.contains(&byte.into())))
+    {
+        word_len += 1;
+        assert!(word_len < WORD_BUFFER_SIZE);
+        forth.word_buffer()[word_len] = byte;
+        byte = read_stdin_byte(forth).unwrap()?;
+    }
+    unsafe { *forth.word_buffer_ptr = word_len as u8 };
     let start_of_string_addr = forth.word_buffer_ptr as isize;
     forth.data_stack().push(start_of_string_addr).unwrap();
-    forth.data_stack().push(word_buffer_ix as isize).unwrap(); // len
     Some(())
 }
 
-fn word_builtin(forth: &mut ForthMachine) {
-    if do_word_builtin(forth).is_none() {
-        bye_builtin(forth)
-    }
+// ( c-addr1 -- c-addr2 u )
+//
+// Read the len of a counted string, and put the len and the address where
+// characters start on the stack.
+fn count_builtin(forth: &mut ForthMachine) {
+    let counted_string_ptr = forth.data_stack().pop().unwrap() as *const u8;
+    assert!(forth.data_space.is_valid_ptr(counted_string_ptr));
+    let len = unsafe { *counted_string_ptr };
+    forth
+        .data_stack()
+        .push((counted_string_ptr as isize).checked_add(1).unwrap())
+        .unwrap();
+    forth.data_stack().push(len as isize).unwrap();
 }
 
 fn store_builtin(forth: &mut ForthMachine) {
@@ -788,7 +817,7 @@ fn number_builtin(forth: &mut ForthMachine) {
 }
 
 // Return name token (start of dict entry) or 0.
-// (addr u - nt | 0)
+// (c-addr u - nt | 0)
 fn find_builtin(forth: &mut ForthMachine) {
     let byte_len = forth.data_stack().pop().unwrap() as usize;
     let ptr = forth.data_stack().pop().unwrap() as *const u8;
@@ -884,9 +913,10 @@ fn allot_builtin(forth: &mut ForthMachine) {
 // fields. This address can be obtained via `>BODY`.
 // NOTE: `DOES>` & `>BODY` are implemented in rforth.fs
 fn create_builtin(forth: &mut ForthMachine) {
-    if do_word_builtin(forth).is_none() {
+    if do_word_builtin(forth, ' ').is_none() {
         return bye_builtin(forth);
     }
+    count_builtin(forth);
     let byte_len = forth.data_stack().pop().unwrap() as usize;
     let ptr = forth.data_stack().pop().unwrap() as *const u8;
     assert!(forth.data_space.is_valid_ptr(ptr));
@@ -943,9 +973,10 @@ fn rbrac_builtin(forth: &mut ForthMachine) {
 }
 
 fn interpret_builtin(forth: &mut ForthMachine) {
-    if do_word_builtin(forth).is_none() {
+    if do_word_builtin(forth, ' ').is_none() {
         return bye_builtin(forth);
     }
+    count_builtin(forth);
     let byte_len = forth.data_stack().pop().unwrap() as usize;
     let ptr = forth.data_stack().pop().unwrap() as *const u8;
     assert!(forth.data_space.is_valid_ptr(ptr));
@@ -1054,7 +1085,7 @@ fn print_data_stack_builtin(forth: &mut ForthMachine) {
 const SPECIAL_CODEWORDS: [(&str, fn(&mut ForthMachine)); 2] =
     [("DOCOL", docol), ("DOCREATE", docreate)];
 
-const BUILTIN_WORDS: [(&str, u8, fn(&mut ForthMachine)); 39] = [
+const BUILTIN_WORDS: [(&str, u8, fn(&mut ForthMachine)); 41] = [
     ("BYE", 0, bye_builtin),
     ("DROP", 0, drop_builtin),
     ("DUP", 0, dup_builtin),
@@ -1062,7 +1093,9 @@ const BUILTIN_WORDS: [(&str, u8, fn(&mut ForthMachine)); 39] = [
     ("EXIT", 0, exit_builtin),
     ("KEY", 0, key_builtin),
     ("EMIT", 0, emit_builtin),
+    ("\\", WordFlag::Immediate as u8, backslash_builtin),
     ("WORD", 0, word_builtin),
+    ("COUNT", 0, count_builtin),
     ("!", 0, store_builtin),
     ("@", 0, fetch_builtin),
     ("C!", 0, store_byte_builtin),
