@@ -1,9 +1,6 @@
-\ Put blank (space) on stack.
-: BL  32 ;
-
 \ Put execution token (xt) on stack; parses at run-time
 \ For parsing during compile-time use word [']
-: '  BL WORD COUNT FIND >CFA ;
+: '  WORD FIND >CFA ;
 
 \ Put execution token (xt) on stack; parses at compile-time
 \ For parsing during run-time use word '
@@ -13,7 +10,7 @@
 
 \ Compile a `word` that would otherwise be IMMEDIATE.
 : [COMPILE] IMMEDIATE
-    BL WORD COUNT FIND >CFA ,
+    WORD FIND >CFA ,
 ;
 
 \ Take whatever `val` is on stack and compile LIT `val`.
@@ -52,13 +49,16 @@ DOES>
 
 \ Read a word and put the first character on stack.
 : CHAR
-  BL WORD COUNT
+  WORD
   DROP  \ Drop the length part
   C@    \ WORD should invoke BYE on zero length string, so this is safe
 ;
 
 \ CHAR for parsing at compile-time
 : [CHAR] IMMEDIATE  CHAR [COMPILE] LITERAL ;
+
+\ Put blank (space) on stack.
+: BL  32 ;
 
 : SPACE  BL EMIT ;
 
