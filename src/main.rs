@@ -279,18 +279,13 @@ impl std::fmt::Debug for DictEntryRef<'_> {
 struct DataSpace {
     memory: Memory,
     dict_head: *mut u8,
-    builtin_addrs: Vec<(usize, String)>,
 }
 
 impl DataSpace {
     pub fn with_size(bytes: usize) -> Self {
-        let mut builtin_addrs = Vec::with_capacity(64);
-        builtin_addrs.push((docol as usize, "DOCOL".to_string()));
-        builtin_addrs.push((docreate as usize, "DOCREATE".to_string()));
         DataSpace {
             memory: Memory::with_size(bytes),
             dict_head: std::ptr::null_mut(),
-            builtin_addrs,
         }
     }
 
@@ -384,16 +379,9 @@ impl DataSpace {
         None
     }
 
-    pub fn is_builtin_addr(&self, addr: usize) -> bool {
-        self.builtin_addrs.iter().any(|(a, _)| *a == addr)
-    }
-
     pub fn push_builtin_word(&mut self, name: &str, flags: u8, word_fn: fn(&mut ForthMachine)) {
         assert!(self.push_dict_entry(name, flags));
         let fn_addr = word_fn as usize;
-        if !self.is_builtin_addr(fn_addr) {
-            self.builtin_addrs.push((fn_addr, name.to_string()));
-        }
         let ptr = self.alloc(PTR_SIZE).unwrap();
         let buf = unsafe { std::slice::from_raw_parts_mut(ptr, PTR_SIZE) };
         let mut cursor = std::io::Cursor::new(buf);
@@ -603,7 +591,9 @@ impl ForthMachine {
         let data_stack = StackImpl::alloc(&mut data_space, data_stack_size);
         let return_stack = StackImpl::alloc(&mut data_space, return_stack_size);
         assert!(data_space.align());
-        add_builtins(&mut data_space);
+        for (name, flags, fun) in BUILTIN_WORDS {
+            data_space.push_builtin_word(name, flags, fun);
+        }
         Self {
             data_space,
             data_stack,
@@ -1061,47 +1051,50 @@ fn print_data_stack_builtin(forth: &mut ForthMachine) {
     })
 }
 
-fn add_builtins(data_space: &mut DataSpace) {
-    data_space.push_builtin_word("BYE", 0, bye_builtin);
-    data_space.push_builtin_word("DROP", 0, drop_builtin);
-    data_space.push_builtin_word("DUP", 0, dup_builtin);
-    data_space.push_builtin_word("SWAP", 0, swap_builtin);
-    data_space.push_builtin_word("EXIT", 0, exit_builtin);
-    data_space.push_builtin_word("KEY", 0, key_builtin);
-    data_space.push_builtin_word("EMIT", 0, emit_builtin);
-    data_space.push_builtin_word("WORD", 0, word_builtin);
-    data_space.push_builtin_word("!", 0, store_builtin);
-    data_space.push_builtin_word("@", 0, fetch_builtin);
-    data_space.push_builtin_word("C!", 0, store_byte_builtin);
-    data_space.push_builtin_word("C@", 0, fetch_byte_builtin);
-    data_space.push_builtin_word("S>NUMBER?", 0, number_builtin);
-    data_space.push_builtin_word("FIND", 0, find_builtin);
-    data_space.push_builtin_word("LATEST", 0, latest_builtin);
-    data_space.push_builtin_word(">CFA", 0, to_cfa_builtin);
-    data_space.push_builtin_word("HIDDEN", 0, hidden_builtin);
-    data_space.push_builtin_word("IMMEDIATE", WordFlag::Immediate as u8, immediate_builtin);
-    data_space.push_builtin_word("BRANCH", 0, branch_builtin);
-    data_space.push_builtin_word("0BRANCH", 0, zbranch_builtin);
-    data_space.push_builtin_word("LIT", 0, lit_builtin);
-    data_space.push_builtin_word("ALLOT", 0, allot_builtin);
-    data_space.push_builtin_word("CREATE", 0, create_builtin);
-    data_space.push_builtin_word(",", 0, comma_builtin);
-    data_space.push_builtin_word("[", WordFlag::Immediate as u8, lbrac_builtin);
-    data_space.push_builtin_word("]", 0, rbrac_builtin);
-    data_space.push_builtin_word("INTERPRET", 0, interpret_builtin);
-    data_space.push_builtin_word("RS-CLEAR", 0, rs_clear_builtin);
-    data_space.push_builtin_word("ALIGN", 0, align_builtin);
-    data_space.push_builtin_word("HERE", 0, here_builtin);
-    data_space.push_builtin_word("UNUSED", 0, unused_builtin);
-    data_space.push_builtin_word("CELLS", 0, cells_builtin);
-    data_space.push_builtin_word("+", 0, add_builtin);
-    data_space.push_builtin_word("-", 0, sub_builtin);
-    data_space.push_builtin_word("EXECUTE", 0, execute_builtin);
-    data_space.push_builtin_word(">R", 0, to_rstack_builtin);
-    data_space.push_builtin_word("R>", 0, from_rstack_builtin);
-    data_space.push_builtin_word("R@", 0, rstack_fetch_builtin);
-    data_space.push_builtin_word(".S", 0, print_data_stack_builtin);
-}
+const SPECIAL_CODEWORDS: [(&str, fn(&mut ForthMachine)); 2] =
+    [("DOCOL", docol), ("DOCREATE", docreate)];
+
+const BUILTIN_WORDS: [(&str, u8, fn(&mut ForthMachine)); 39] = [
+    ("BYE", 0, bye_builtin),
+    ("DROP", 0, drop_builtin),
+    ("DUP", 0, dup_builtin),
+    ("SWAP", 0, swap_builtin),
+    ("EXIT", 0, exit_builtin),
+    ("KEY", 0, key_builtin),
+    ("EMIT", 0, emit_builtin),
+    ("WORD", 0, word_builtin),
+    ("!", 0, store_builtin),
+    ("@", 0, fetch_builtin),
+    ("C!", 0, store_byte_builtin),
+    ("C@", 0, fetch_byte_builtin),
+    ("S>NUMBER?", 0, number_builtin),
+    ("FIND", 0, find_builtin),
+    ("LATEST", 0, latest_builtin),
+    (">CFA", 0, to_cfa_builtin),
+    ("HIDDEN", 0, hidden_builtin),
+    ("IMMEDIATE", WordFlag::Immediate as u8, immediate_builtin),
+    ("BRANCH", 0, branch_builtin),
+    ("0BRANCH", 0, zbranch_builtin),
+    ("LIT", 0, lit_builtin),
+    ("ALLOT", 0, allot_builtin),
+    ("CREATE", 0, create_builtin),
+    (",", 0, comma_builtin),
+    ("[", WordFlag::Immediate as u8, lbrac_builtin),
+    ("]", 0, rbrac_builtin),
+    ("INTERPRET", 0, interpret_builtin),
+    ("RS-CLEAR", 0, rs_clear_builtin),
+    ("ALIGN", 0, align_builtin),
+    ("HERE", 0, here_builtin),
+    ("UNUSED", 0, unused_builtin),
+    ("CELLS", 0, cells_builtin),
+    ("+", 0, add_builtin),
+    ("-", 0, sub_builtin),
+    ("EXECUTE", 0, execute_builtin),
+    (">R", 0, to_rstack_builtin),
+    ("R>", 0, from_rstack_builtin),
+    ("R@", 0, rstack_fetch_builtin),
+    (".S", 0, print_data_stack_builtin),
+];
 
 fn exec_fun_indirect(addr: usize, forth: &mut ForthMachine) {
     forth.curr_def_addr = addr;
@@ -1112,18 +1105,22 @@ fn exec_fun_indirect(addr: usize, forth: &mut ForthMachine) {
         addr = addr,
     );
     let fun_addr = unsafe { *(addr as *const usize) };
-    let maybe_builtin = forth
-        .data_space
-        .builtin_addrs
+    let maybe_builtin = SPECIAL_CODEWORDS
         .iter()
-        .find(|(a, _)| *a == fun_addr);
+        .copied()
+        .chain(
+            BUILTIN_WORDS
+                .iter()
+                .map(|(name, _flags, fun)| (*name, *fun)),
+        )
+        .find(|(_, fun)| *fun as usize == fun_addr);
     // TODO: Setup debugging & tracing facilities.
     // match maybe_builtin {
     //     None => println!("Executing fun at {:#x}", fun_addr),
-    //     Some((_, name)) => println!("Executing '{}' ({:#x})", name, fun_addr),
+    //     Some((name, _)) => println!("Executing '{}' ({:#x})", name, fun_addr),
     // }
     assert!(maybe_builtin.is_some());
-    let fun: fn(&mut ForthMachine) = unsafe { std::mem::transmute(fun_addr as *const u8) };
+    let fun = maybe_builtin.unwrap().1;
     fun(forth)
 }
 
