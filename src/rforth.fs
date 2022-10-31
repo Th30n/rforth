@@ -21,6 +21,9 @@
 
 : CELL+  1 CELLS + ;
 
+\ Compile a recursive call to word currently being defined.
+: RECURSE IMMEDIATE  LATEST >CFA , ;
+
 \ DOES> will modify the latest CREATEd word.
 \ It can be only used in a colon definition.
 : DOES> IMMEDIATE
@@ -37,6 +40,8 @@
 
 \ Get data field address from an execution token
 : >BODY  2 CELLS + ;
+
+: VARIABLE  CREATE 0 , ;
 
 : CONSTANT
     CREATE ,
