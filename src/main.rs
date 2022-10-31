@@ -1,6 +1,6 @@
 use clap::Parser;
 use std::convert::TryFrom;
-use std::io::{Read, Write};
+use std::io::Write;
 
 const PTR_SIZE: usize = std::mem::size_of::<usize>();
 
@@ -142,10 +142,7 @@ fn test_memory_align() {
     assert_eq!(memory.unused(), 1024 - 16 - 8);
 }
 
-/// Size of buffer for WORD word, as well as the maximum length of a name
-/// string for a dict entry, i.e. word.
-const WORD_BUFFER_SIZE: usize = 32;
-// Mask for fitting WORD_BUFFER_SIZE, though this could fit up to 63 bytes.
+// Mask for fitting dict entry's name length, this can fit up to 63 bytes.
 const DICT_ENTRY_LEN_MASK: u8 = 0x3f;
 // Flags must not overlap with the len mask.
 #[repr(u8)]
@@ -332,7 +329,7 @@ impl DataSpace {
     #[must_use]
     pub fn push_dict_entry(&mut self, name: &str, flags: u8) -> bool {
         assert_eq!(flags & DICT_ENTRY_LEN_MASK, 0);
-        assert!(name.len() <= WORD_BUFFER_SIZE);
+        assert!(name.len() <= DICT_ENTRY_LEN_MASK as usize);
         let prev_addr = self.dict_head as usize;
         let entry_size = PTR_SIZE + 1 + name.len();
         match self.alloc(entry_size) {
@@ -426,7 +423,7 @@ fn test_data_space_find_entry() {
 
 const FORTH_TRUE: isize = -1;
 const FORTH_FALSE: isize = 0;
-const INPUT_BUFFER_SIZE: usize = 4096;
+const INPUT_BUFFER_SIZE: usize = 256;
 
 #[derive(Debug)]
 struct StackImpl {
@@ -570,12 +567,10 @@ struct ForthMachine {
     return_stack: StackImpl,
     curr_def_addr: usize,
     instruction_addr: usize,
-    // Input bufer and vars for KEY word.
-    input_buffer: [u8; INPUT_BUFFER_SIZE],
     curr_input_ix: usize,
     curr_input_len: usize,
-    // Buffer inside `data_space` for WORD word; length is WORD_BUFFER_SIZE
-    word_buffer_ptr: *mut u8,
+    // Stdin line parse area inside `data_space`; length is INPUT_BUFFER_SIZE.
+    input_buffer_ptr: *mut u8,
     // TODO: Move state to DataSpace
     state: ForthState,
 }
@@ -586,7 +581,7 @@ impl ForthMachine {
         data_stack_size: usize,
         return_stack_size: usize,
     ) -> Self {
-        let word_buffer_ptr = data_space.alloc(WORD_BUFFER_SIZE).unwrap();
+        let input_buffer_ptr = data_space.alloc(INPUT_BUFFER_SIZE).unwrap();
         assert!(data_space.align());
         let data_stack = StackImpl::alloc(&mut data_space, data_stack_size);
         let return_stack = StackImpl::alloc(&mut data_space, return_stack_size);
@@ -600,16 +595,15 @@ impl ForthMachine {
             return_stack,
             instruction_addr: 0,
             curr_def_addr: 0,
-            input_buffer: [0; INPUT_BUFFER_SIZE],
             curr_input_ix: 0,
             curr_input_len: 0,
-            word_buffer_ptr,
+            input_buffer_ptr,
             state: ForthState::Immediate,
         }
     }
 
-    fn word_buffer(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.word_buffer_ptr, WORD_BUFFER_SIZE) }
+    fn input_buffer(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.input_buffer_ptr, INPUT_BUFFER_SIZE) }
     }
 
     fn data_stack(&mut self) -> Stack {
@@ -633,6 +627,11 @@ fn bye_builtin(forth: &mut ForthMachine) {
 
 fn drop_builtin(forth: &mut ForthMachine) {
     forth.data_stack().pop().unwrap();
+}
+
+fn nip_builtin(forth: &mut ForthMachine) {
+    let val = forth.data_stack().pop().unwrap();
+    *forth.data_stack().last_mut().unwrap() = val;
 }
 
 fn dup_builtin(forth: &mut ForthMachine) {
@@ -661,29 +660,47 @@ fn exit_builtin(forth: &mut ForthMachine) {
     forth.instruction_addr = forth.return_stack().pop().unwrap() as usize;
 }
 
-// Return Ok(None) on EOF.
-fn read_stdin_byte(forth: &mut ForthMachine) -> std::io::Result<Option<u8>> {
-    if forth.curr_input_ix == forth.curr_input_len {
-        let num_read = std::io::stdin().read(&mut forth.input_buffer)?;
-        // Handle EOF
-        if num_read == 0 {
-            return Ok(None);
+fn refill_builtin(forth: &mut ForthMachine) {
+    let mut line = String::with_capacity(INPUT_BUFFER_SIZE);
+    if let Ok(num_read) = std::io::stdin().read_line(&mut line) {
+        assert!(num_read <= INPUT_BUFFER_SIZE);
+        if num_read > 0 {
+            assert_eq!(
+                forth.input_buffer().write(line.as_bytes()).unwrap(),
+                num_read
+            );
+            forth.curr_input_len = num_read;
+            forth.curr_input_ix = 0;
+            forth.data_stack().push(FORTH_TRUE).unwrap();
+            return;
         }
-        forth.curr_input_len = num_read;
-        forth.curr_input_ix = 0;
     }
-    assert!(forth.curr_input_ix < forth.curr_input_len);
-    assert!(forth.curr_input_len <= forth.input_buffer.len());
-    let byte = forth.input_buffer[forth.curr_input_ix];
-    forth.curr_input_ix += 1;
-    Ok(Some(byte))
+    forth.data_stack().push(FORTH_FALSE).unwrap();
 }
 
-fn key_builtin(forth: &mut ForthMachine) {
-    if let Some(byte) = read_stdin_byte(forth).unwrap() {
-        forth.data_stack().push(byte as isize).unwrap()
+fn source_builtin(forth: &mut ForthMachine) {
+    let ptr = forth.input_buffer_ptr;
+    forth.data_stack().push(ptr as isize).unwrap();
+    let len = forth.curr_input_len;
+    forth.data_stack().push(len as isize).unwrap();
+}
+
+fn to_in_builtin(forth: &mut ForthMachine) {
+    // TODO: Make this a variable, not a constant.
+    let curr_ix = forth.curr_input_ix;
+    forth.data_stack().push(curr_ix as isize).unwrap();
+}
+
+fn read_input_byte(forth: &mut ForthMachine) -> Option<u8> {
+    if forth.curr_input_ix == forth.curr_input_len {
+        None
     } else {
-        bye_builtin(forth)
+        let curr_ix = forth.curr_input_ix;
+        assert!(curr_ix < forth.curr_input_len);
+        assert!(forth.curr_input_len <= INPUT_BUFFER_SIZE);
+        let byte = forth.input_buffer()[curr_ix];
+        forth.curr_input_ix += 1;
+        Some(byte)
     }
 }
 
@@ -695,15 +712,7 @@ fn emit_builtin(forth: &mut ForthMachine) {
 // ( "ccc<eol>" -- )
 // Parses and discards \ comments
 fn backslash_builtin(forth: &mut ForthMachine) {
-    let mut do_backslash = || -> Option<()> {
-        let mut byte = read_stdin_byte(forth).unwrap()?;
-        // Skip comment until newline or EOF
-        while byte != b'\n' {
-            byte = read_stdin_byte(forth).unwrap()?;
-        }
-        Some(())
-    };
-    do_backslash();
+    forth.curr_input_ix = forth.curr_input_len
 }
 
 const BLANK_CHARS: [char; 3] = [' ', '\t', '\n'];
@@ -713,27 +722,36 @@ const BLANK_CHARS: [char; 3] = [' ', '\t', '\n'];
 // Skip leading white space and parse `name` delimited by a white space.
 // NOTE: Behaves like standard PARSE-NAME, not like WORD.
 fn word_builtin(forth: &mut ForthMachine) {
-    if do_word_builtin(forth).is_none() {
-        bye_builtin(forth)
-    }
+    let (ptr, len) = match do_word_builtin(forth) {
+        None => (
+            unsafe { forth.input_buffer_ptr.add(INPUT_BUFFER_SIZE) as *const u8 },
+            0,
+        ),
+        Some((ptr, len)) => (ptr, len),
+    };
+    forth.data_stack().push(ptr as isize).unwrap();
+    forth.data_stack().push(len as isize).unwrap();
 }
-fn do_word_builtin(forth: &mut ForthMachine) -> Option<()> {
-    let mut byte = read_stdin_byte(forth).unwrap()?;
+fn do_word_builtin(forth: &mut ForthMachine) -> Option<(*const u8, usize)> {
+    let mut byte = read_input_byte(forth)?;
     // Skip blanks
     while BLANK_CHARS.contains(&byte.into()) {
-        byte = read_stdin_byte(forth).unwrap()?;
+        byte = read_input_byte(forth)?;
     }
-    let mut word_buffer_ix = 0;
+    assert!(forth.curr_input_ix > 0);
+    assert!(forth.curr_input_ix <= INPUT_BUFFER_SIZE);
+    let start_ptr = unsafe { forth.input_buffer_ptr.add(forth.curr_input_ix - 1) };
+    let mut len = 0;
     while !BLANK_CHARS.contains(&byte.into()) {
-        assert!(word_buffer_ix < WORD_BUFFER_SIZE);
-        forth.word_buffer()[word_buffer_ix] = byte;
-        byte = read_stdin_byte(forth).unwrap()?;
-        word_buffer_ix += 1;
+        len += 1;
+        match read_input_byte(forth) {
+            None => break,
+            Some(b) => byte = b,
+        }
     }
-    let start_of_string_addr = forth.word_buffer_ptr as isize;
-    forth.data_stack().push(start_of_string_addr).unwrap();
-    forth.data_stack().push(word_buffer_ix as isize).unwrap(); // len
-    Some(())
+    assert!(forth.curr_input_ix <= INPUT_BUFFER_SIZE);
+    assert!(len > 0);
+    Some((start_ptr, len as usize))
 }
 
 fn store_builtin(forth: &mut ForthMachine) {
@@ -891,11 +909,7 @@ fn allot_builtin(forth: &mut ForthMachine) {
 // fields. This address can be obtained via `>BODY`.
 // NOTE: `DOES>` & `>BODY` are implemented in rforth.fs
 fn create_builtin(forth: &mut ForthMachine) {
-    if do_word_builtin(forth).is_none() {
-        return bye_builtin(forth);
-    }
-    let byte_len = forth.data_stack().pop().unwrap() as usize;
-    let ptr = forth.data_stack().pop().unwrap() as *const u8;
+    let (ptr, byte_len) = do_word_builtin(forth).unwrap();
     assert!(forth.data_space.is_valid_ptr(ptr));
     assert!(forth
         .data_space
@@ -949,12 +963,12 @@ fn rbrac_builtin(forth: &mut ForthMachine) {
     forth.state = ForthState::Compile;
 }
 
-fn interpret_builtin(forth: &mut ForthMachine) {
-    if do_word_builtin(forth).is_none() {
-        return bye_builtin(forth);
-    }
-    let byte_len = forth.data_stack().pop().unwrap() as usize;
-    let ptr = forth.data_stack().pop().unwrap() as *const u8;
+// Interpret a *single* word in the parse area (if available).
+fn interpret_single_builtin(forth: &mut ForthMachine) {
+    let (ptr, byte_len) = match do_word_builtin(forth) {
+        None => return,
+        Some((ptr, byte_len)) => (ptr, byte_len),
+    };
     assert!(forth.data_space.is_valid_ptr(ptr));
     assert!(forth
         .data_space
@@ -1035,6 +1049,15 @@ fn sub_builtin(forth: &mut ForthMachine) {
     *a = a.wrapping_sub(b);
 }
 
+fn u_greater_than_builtin(forth: &mut ForthMachine) {
+    let mut data_stack = forth.data_stack();
+    let b = data_stack.pop().unwrap() as usize;
+    let a = data_stack.pop().unwrap() as usize;
+    data_stack
+        .push(if a > b { FORTH_TRUE } else { FORTH_FALSE })
+        .unwrap();
+}
+
 fn to_rstack_builtin(forth: &mut ForthMachine) {
     let ret_addr = forth.data_stack().pop().unwrap();
     forth.return_stack().push(ret_addr).unwrap();
@@ -1061,13 +1084,16 @@ fn print_data_stack_builtin(forth: &mut ForthMachine) {
 const SPECIAL_CODEWORDS: [(&str, fn(&mut ForthMachine)); 2] =
     [("DOCOL", docol), ("DOCREATE", docreate)];
 
-const BUILTIN_WORDS: [(&str, u8, fn(&mut ForthMachine)); 40] = [
+const BUILTIN_WORDS: [(&str, u8, fn(&mut ForthMachine)); 44] = [
     ("BYE", 0, bye_builtin),
     ("DROP", 0, drop_builtin),
+    ("NIP", 0, nip_builtin),
     ("DUP", 0, dup_builtin),
     ("SWAP", 0, swap_builtin),
     ("EXIT", 0, exit_builtin),
-    ("KEY", 0, key_builtin),
+    ("REFILL", 0, refill_builtin),
+    ("SOURCE", 0, source_builtin),
+    (">IN", 0, to_in_builtin),
     ("EMIT", 0, emit_builtin),
     ("\\", WordFlag::Immediate as u8, backslash_builtin),
     ("WORD", 0, word_builtin),
@@ -1089,7 +1115,7 @@ const BUILTIN_WORDS: [(&str, u8, fn(&mut ForthMachine)); 40] = [
     (",", 0, comma_builtin),
     ("[", WordFlag::Immediate as u8, lbrac_builtin),
     ("]", 0, rbrac_builtin),
-    ("INTERPRET", 0, interpret_builtin),
+    ("INTERPRET-SINGLE", 0, interpret_single_builtin),
     ("RS-CLEAR", 0, rs_clear_builtin),
     ("ALIGN", 0, align_builtin),
     ("HERE", 0, here_builtin),
@@ -1097,6 +1123,7 @@ const BUILTIN_WORDS: [(&str, u8, fn(&mut ForthMachine)); 40] = [
     ("CELLS", 0, cells_builtin),
     ("+", 0, add_builtin),
     ("-", 0, sub_builtin),
+    ("U>", 0, u_greater_than_builtin),
     ("EXECUTE", 0, execute_builtin),
     (">R", 0, to_rstack_builtin),
     ("R>", 0, from_rstack_builtin),
@@ -1180,24 +1207,10 @@ where
     push_instruction(data_space, def_addr);
 }
 
-fn set_instructions<'a, I>(forth: &mut ForthMachine, words: I)
-where
-    I: IntoIterator<Item = &'a str>,
-{
+fn set_instruction(forth: &mut ForthMachine, word: &str) {
     assert!(forth.data_space.align());
-    for word in words {
-        let def_addr = forth.data_space.find_entry(word).unwrap().definition_addr();
-        let instruction_addr = push_instruction(&mut forth.data_space, def_addr);
-        if forth.instruction_addr == 0 {
-            forth.instruction_addr = instruction_addr;
-        }
-    }
-    let def_addr = forth
-        .data_space
-        .find_entry("BYE")
-        .unwrap()
-        .definition_addr();
-    push_instruction(&mut forth.data_space, def_addr);
+    let def_addr = forth.data_space.find_entry(word).unwrap().definition_addr();
+    forth.instruction_addr = push_instruction(&mut forth.data_space, def_addr);
 }
 
 fn parse_memsize(val: &str) -> clap::error::Result<usize> {
@@ -1313,11 +1326,37 @@ fn main() {
     );
     push_word(
         &mut forth.data_space,
+        "INTERPRET",
+        0,
+        [
+            "INTERPRET-SINGLE",
+            "SOURCE", // ( c-addr len )
+            "NIP",    // ( len )
+            ">IN",    /* @ */
+            // ( len offset )
+            "U>",
+            "0BRANCH",
+            &(3 * PTR_SIZE).to_string(), // If false jump to exit.
+            "BRANCH",                    // If len > offset, repeat interpret.
+            &(-8 * PTR_SIZE as isize).to_string(),
+        ],
+    );
+    push_word(
+        &mut forth.data_space,
         "QUIT",
         0,
-        ["RS-CLEAR", "INTERPRET", "BRANCH", "-16"],
+        [
+            "RS-CLEAR",
+            "REFILL",
+            "0BRANCH",
+            &(4 * PTR_SIZE).to_string(),
+            "INTERPRET",
+            "BRANCH",
+            &(-5 * PTR_SIZE as isize).to_string(),
+            "BYE",
+        ],
     );
-    set_instructions(&mut forth, ["QUIT"]);
+    set_instruction(&mut forth, "QUIT");
     println!("unused {} bytes", fmt_memsize(forth.data_space.unused()));
     while forth.instruction_addr != 0 {
         next(&mut forth);
