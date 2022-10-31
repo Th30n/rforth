@@ -9,7 +9,7 @@
 ;
 
 \ Compile a `word` that would otherwise be IMMEDIATE.
-: [COMPILE] IMMEDIATE
+: POSTPONE IMMEDIATE
     WORD FIND >CFA ,
 ;
 
@@ -51,11 +51,11 @@ DOES>
 : CHAR
   WORD
   DROP  \ Drop the length part
-  C@    \ WORD should invoke BYE on zero length string, so this is safe
+  C@    \ If read len was 9, this will read some memory after the input
 ;
 
 \ CHAR for parsing at compile-time
-: [CHAR] IMMEDIATE  CHAR [COMPILE] LITERAL ;
+: [CHAR] IMMEDIATE  CHAR POSTPONE LITERAL ;
 
 \ Put blank (space) on stack.
 : BL  32 ;
