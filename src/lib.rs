@@ -692,6 +692,16 @@ fn swap_builtin(forth: &mut ForthMachine) {
     data_stack.push(b).unwrap();
 }
 
+fn rot_builtin(forth: &mut ForthMachine) {
+    let mut data_stack = forth.data_stack();
+    let a = data_stack.pop().unwrap();
+    let b = data_stack.pop().unwrap();
+    let c = data_stack.pop().unwrap();
+    data_stack.push(b).unwrap();
+    data_stack.push(a).unwrap();
+    data_stack.push(c).unwrap();
+}
+
 // DOCOL is special, it is a codeword and as such its direct address should be
 // used when creating new words.
 // TODO: Maybe make a DOCOL word (constant) that pushes this address on stack.
@@ -1089,6 +1099,63 @@ fn sub_builtin(forth: &mut ForthMachine) {
     *a = a.wrapping_sub(b);
 }
 
+fn mul_builtin(forth: &mut ForthMachine) {
+    let mut data_stack = forth.data_stack();
+    let b = data_stack.pop().unwrap();
+    let a = data_stack.last_mut().unwrap();
+    *a = a.wrapping_mul(b);
+}
+
+fn slash_mod_builtin(forth: &mut ForthMachine) {
+    let mut data_stack = forth.data_stack();
+    let b = data_stack.pop().unwrap();
+    let a = data_stack.pop().unwrap();
+    assert_ne!(b, 0, "division by zero");
+    data_stack.push(a % b).unwrap();
+    data_stack.push(a / b).unwrap();
+}
+
+fn invert_builtin(forth: &mut ForthMachine) {
+    let mut data_stack = forth.data_stack();
+    let a = data_stack.pop().unwrap();
+    data_stack.push(!a).unwrap();
+}
+
+fn and_builtin(forth: &mut ForthMachine) {
+    let mut data_stack = forth.data_stack();
+    let b = data_stack.pop().unwrap() as usize;
+    let a = data_stack.pop().unwrap() as usize;
+    data_stack.push((a & b) as isize).unwrap();
+}
+
+fn or_builtin(forth: &mut ForthMachine) {
+    let mut data_stack = forth.data_stack();
+    let b = data_stack.pop().unwrap() as usize;
+    let a = data_stack.pop().unwrap() as usize;
+    data_stack.push((a | b) as isize).unwrap();
+}
+
+fn xor_builtin(forth: &mut ForthMachine) {
+    let mut data_stack = forth.data_stack();
+    let b = data_stack.pop().unwrap() as usize;
+    let a = data_stack.pop().unwrap() as usize;
+    data_stack.push((a ^ b) as isize).unwrap();
+}
+
+fn lshift_builtin(forth: &mut ForthMachine) {
+    let mut data_stack = forth.data_stack();
+    let b = data_stack.pop().unwrap() as usize;
+    let a = data_stack.pop().unwrap() as usize;
+    data_stack.push((a << b) as isize).unwrap();
+}
+
+fn rshift_builtin(forth: &mut ForthMachine) {
+    let mut data_stack = forth.data_stack();
+    let b = data_stack.pop().unwrap() as usize;
+    let a = data_stack.pop().unwrap() as usize;
+    data_stack.push((a >> b) as isize).unwrap();
+}
+
 fn u_greater_than_builtin(forth: &mut ForthMachine) {
     let mut data_stack = forth.data_stack();
     let b = data_stack.pop().unwrap() as usize;
@@ -1124,17 +1191,27 @@ fn print_data_stack_builtin(forth: &mut ForthMachine) {
 const SPECIAL_CODEWORDS: [(&str, fn(&mut ForthMachine)); 2] =
     [("DOCOL", docol), ("DOCREATE", docreate)];
 
-const BUILTIN_WORDS: [(&str, u8, fn(&mut ForthMachine)); 43] = [
+const BUILTIN_WORDS: [(&str, u8, fn(&mut ForthMachine)); 52] = [
     // Stack manipulation
     (".S", 0, print_data_stack_builtin),
     ("DROP", 0, drop_builtin),
     ("DUP", 0, dup_builtin),
     ("NIP", 0, nip_builtin),
+    ("ROT", 0, rot_builtin),
     ("SWAP", 0, swap_builtin),
     // Arithmetic
+    ("*", 0, mul_builtin),
     ("+", 0, add_builtin),
     ("-", 0, sub_builtin),
+    ("/MOD", 0, slash_mod_builtin),
     ("U>", 0, u_greater_than_builtin),
+    // Bit operations
+    ("AND", 0, and_builtin),
+    ("INVERT", 0, invert_builtin),
+    ("LSHIFT", 0, lshift_builtin),
+    ("OR", 0, or_builtin),
+    ("RSHIFT", 0, rshift_builtin),
+    ("XOR", 0, xor_builtin),
     // Input buffer & parse area
     // `>IN` is a variable defined in `ForthMachine::new`
     ("REFILL", 0, refill_builtin),
