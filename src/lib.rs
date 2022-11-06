@@ -1156,6 +1156,15 @@ fn rshift_builtin(forth: &mut ForthMachine) {
     data_stack.push((a >> b) as isize).unwrap();
 }
 
+fn eq_builtin(forth: &mut ForthMachine) {
+    let mut data_stack = forth.data_stack();
+    let b = data_stack.pop().unwrap();
+    let a = data_stack.pop().unwrap();
+    data_stack
+        .push(if a == b { FORTH_TRUE } else { FORTH_FALSE })
+        .unwrap();
+}
+
 fn u_greater_than_builtin(forth: &mut ForthMachine) {
     let mut data_stack = forth.data_stack();
     let b = data_stack.pop().unwrap() as usize;
@@ -1191,7 +1200,7 @@ fn print_data_stack_builtin(forth: &mut ForthMachine) {
 const SPECIAL_CODEWORDS: [(&str, fn(&mut ForthMachine)); 2] =
     [("DOCOL", docol), ("DOCREATE", docreate)];
 
-const BUILTIN_WORDS: [(&str, u8, fn(&mut ForthMachine)); 52] = [
+const BUILTIN_WORDS: [(&str, u8, fn(&mut ForthMachine)); 53] = [
     // Stack manipulation
     (".S", 0, print_data_stack_builtin),
     ("DROP", 0, drop_builtin),
@@ -1204,6 +1213,7 @@ const BUILTIN_WORDS: [(&str, u8, fn(&mut ForthMachine)); 52] = [
     ("+", 0, add_builtin),
     ("-", 0, sub_builtin),
     ("/MOD", 0, slash_mod_builtin),
+    ("=", 0, eq_builtin),
     ("U>", 0, u_greater_than_builtin),
     // Bit operations
     ("AND", 0, and_builtin),

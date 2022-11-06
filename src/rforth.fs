@@ -123,3 +123,66 @@ DOES>
     HERE SWAP -   \ offset to be filled for WHILE
     SWAP !
 ;
+
+\ END CONTROL STRUCTURES
+\ ======================
+
+\ TODO: Make these builtin?
+\ ( x1 x2 -- x1 x2 x1 )
+: OVER  >R DUP R> SWAP ;
+\ ( x1 x2 -- x2 x1 x2 )
+: TUCK  SWAP OVER ;
+: 2DROP  DROP DROP ;
+
+\ Add n|u to single cell number at a-addr
+\ ( n|u a-addr -- )
+: +!
+    DUP @ \ ( n|u a-addr orig )
+    ROT + \ ( a-addr new )
+    SWAP !
+;
+
+\ Get total source length and current address of input
+\ ( u c-addr )
+: CURR-SOURCE
+  SOURCE \ ( input-addr input-len )
+  SWAP >IN @ +
+;
+
+\ Calculate len of c-addr to current >IN
+\ ( c-addr -- u )
+: IN-LEN-FROM
+    CURR-SOURCE NIP \ ( c-addr end-addr )
+    SWAP -
+;
+
+\ Parse `ccc` delimited by `char`
+\ ( char "ccc<char" -- c-addr u )
+: PARSE
+    CURR-SOURCE     \ ( char input-len c-addr )
+    >R              \ store c-addr on return stack for later
+    BEGIN           \ ( char input-len ) ( R: c-addr )
+      >IN @ U>      \ input-len > input-ix
+    WHILE           \ ( char ) ( R: c-addr )
+      CURR-SOURCE   \ ( char input-len curr-addr ) ( R: c-addr )
+      C@ ROT        \ ( input-len curr-char char ) ( R: c-addr )
+      1 >IN +!      \ increment >IN
+      TUCK          \ ( input-len char curr-char char ) ( R: c-addr )
+      = IF          \ ( input-len char ) ( R: c-addr )
+        2DROP
+        R> DUP      \ ( c-addr c-addr )
+        IN-LEN-FROM \ ( c-addr u )
+        EXIT
+      THEN          \ ( input-len char ) ( R: c-addr )
+      SWAP
+    REPEAT          \ ( char input-len ) ( R: c-addr )
+    2DROP
+    R> DUP
+    IN-LEN-FROM
+;
+
+: ( IMMEDIATE  [CHAR] ) PARSE 2DROP ;
+
+( We can now write comments with ( ... )
+( NOTE: Nesting is not supported       )
+( ==================================== )
