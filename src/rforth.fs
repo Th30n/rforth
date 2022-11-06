@@ -96,3 +96,30 @@ DOES>
     HERE SWAP -
     SWAP !
 ;
+
+: BEGIN IMMEDIATE  HERE ;
+
+: UNTIL IMMEDIATE
+    ['] 0BRANCH , \ if test was false, jump to BEGIN
+    HERE - ,      \ offset is BEGIN's location minus HERE.
+;
+
+\ Infinite loop for BEGIN
+: AGAIN IMMEDIATE
+    ['] BRANCH ,
+    HERE - ,
+;
+
+: WHILE IMMEDIATE
+    ['] 0BRANCH , \ if test was false, jump to location set by REPEAT
+    HERE          \ save location of the offset
+    0 ,           \ compile dummy offset
+;
+
+: REPEAT IMMEDIATE
+    ['] BRANCH ,  \ jump to original BEGIN's location
+    SWAP HERE - , \ offset to BEGIN's location
+    DUP
+    HERE SWAP -   \ offset to be filled for WHILE
+    SWAP !
+;
