@@ -133,6 +133,11 @@ DOES>
 \ ( x1 x2 -- x2 x1 x2 )
 : TUCK  SWAP OVER ;
 : 2DROP  DROP DROP ;
+\ ( x1 x2 -- x1 x2 x1 x2 )
+: 2DUP  OVER OVER ;
+
+: 1-  1 - ;
+: 1+  1 + ;
 
 \ Add n|u to single cell number at a-addr
 \ ( n|u a-addr -- )
@@ -186,3 +191,17 @@ DOES>
 ( We can now write comments with ( ... )
 ( NOTE: Nesting is not supported       )
 ( ==================================== )
+
+\ Display a character string.
+( c-addr u -- )
+: TYPE
+    OVER + SWAP
+    BEGIN     ( end-addr c-addr )
+      2DUP U>
+    WHILE     ( end-addr c-addr )
+      DUP C@  ( end-addr c-addr char )
+      EMIT    ( end-addr c-addr )
+      1+      \ increment c-addr
+    REPEAT    ( end-addr c-addr )
+    2DROP
+;
