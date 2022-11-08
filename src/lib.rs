@@ -833,6 +833,20 @@ fn fetch_byte_builtin(forth: &mut ForthMachine) {
     forth.data_stack().push(*addr_ref as isize).unwrap()
 }
 
+fn parse_num(src: &str, radix: u32) -> Result<isize, std::num::ParseIntError> {
+    if let Some(src) = src.strip_prefix('#') {
+        isize::from_str_radix(src, 10)
+    } else if let Some(src) = src.strip_prefix('$') {
+        isize::from_str_radix(src, 16)
+    } else if let Some(src) = src.strip_prefix('%') {
+        isize::from_str_radix(src, 2)
+    } else if src.starts_with('\'') && src.ends_with('\'') && src.chars().count() == 3 {
+        Ok(src.chars().nth(1).unwrap() as isize)
+    } else {
+        isize::from_str_radix(src, radix)
+    }
+}
+
 // Converts string to number, flag indicates success.
 // (addr u - n f)
 // NOTE: Based on Gforth's S>NUMBER?, but we return a single cell number.
@@ -850,7 +864,8 @@ fn s_to_number_builtin(forth: &mut ForthMachine) {
         .is_valid_ptr((ptr as usize + byte_len - 1) as *const u8));
     let bytes = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
     // TODO: Use BASE variable for parsing.
-    match std::str::from_utf8(bytes).unwrap().parse() {
+    let base = 10;
+    match parse_num(std::str::from_utf8(bytes).unwrap(), base) {
         Ok(num) => {
             forth.data_stack().push(num).unwrap();
             forth.data_stack().push(FORTH_TRUE).unwrap();
@@ -1036,8 +1051,8 @@ fn interpret_single_builtin(forth: &mut ForthMachine) {
         }
     } else {
         // TODO: Use BASE variable for parsing.
-        let num: isize = name
-            .parse()
+        let base = 10;
+        let num = parse_num(name, base)
             .unwrap_or_else(|_| panic!("Unable to parse '{}' as number", name));
         match forth.state {
             ForthState::Immediate => forth.data_stack().push(num).unwrap(),
@@ -1332,7 +1347,8 @@ where
                 push_instruction(data_space, entry.definition_addr());
             }
             None => {
-                let num: isize = word.parse().unwrap();
+                let base = 10;
+                let num = parse_num(word, base).unwrap();
                 // push_instruction(
                 //     data_space,
                 //     data_space.find_entry("LIT").unwrap().definition_addr(),
