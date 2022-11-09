@@ -138,6 +138,12 @@ DOES>
 
 : 1-  1 - ;
 : 1+  1 + ;
+: <>  = INVERT ;
+: <  2DUP <> >R SWAP > R> AND ;
+: 0=  0 = ;
+: 0>  0 > ;
+: 0<  0 < ;
+: 0<> 0 <> ;
 
 \ Add n|u to single cell number at a-addr
 \ ( n|u a-addr -- )
