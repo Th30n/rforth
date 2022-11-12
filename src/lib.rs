@@ -395,7 +395,12 @@ impl DataSpace {
         None
     }
 
-    pub fn push_builtin_word(&mut self, name: &str, flags: u8, word_fn: fn(&mut ForthMachine)) {
+    pub fn push_builtin_word(
+        &mut self,
+        name: &str,
+        flags: u8,
+        word_fn: fn(&mut ForthMachine) -> Result<(), ForthError>,
+    ) {
         assert!(self.push_dict_entry(name, flags));
         let fn_addr = word_fn as usize;
         let ptr = self.alloc(PTR_SIZE).unwrap();
@@ -587,6 +592,24 @@ enum ForthState {
 }
 
 #[derive(Debug)]
+pub enum ForthError {
+    DataStackEmpty,
+    DataStackLimitReached,
+    ReturnStackEmpty,
+    ReturnStackLimitReached,
+    InputBufferLimitReached,
+    AllocFailed,
+    DeallocFailed,
+    InvalidPointer(usize),
+    AddressOverflow(usize),
+    NoLatestEntry,
+    CreateMissingWord,
+    InvalidStringEncoding,
+    ParseNum(String),
+    DivByZero,
+}
+
+#[derive(Debug)]
 pub struct ForthMachine {
     data_space: DataSpace,
     data_stack: StackImpl,
@@ -598,6 +621,10 @@ pub struct ForthMachine {
     // Stdin line parse area inside `data_space`; length is INPUT_BUFFER_SIZE.
     input_buffer_ptr: *mut u8,
     state: ForthState,
+    // Backtrace of words when error happens. (this is only from
+    // exec_fun_indirect, we need to traverse the return stack and try
+    // decompiling)
+    backtrace: Vec<String>,
 }
 
 impl ForthMachine {
@@ -625,6 +652,7 @@ impl ForthMachine {
             curr_input_len: 0,
             input_buffer_ptr,
             state: ForthState::Immediate,
+            backtrace: vec![],
         }
     }
 
@@ -655,7 +683,7 @@ impl ForthMachine {
     }
 
     pub fn bye(&mut self) {
-        bye_builtin(self)
+        bye_builtin(self).unwrap();
     }
 
     pub fn push_variable(&mut self, name: &str, val: isize) -> *mut isize {
@@ -666,58 +694,105 @@ impl ForthMachine {
     }
 }
 
-fn bye_builtin(forth: &mut ForthMachine) {
+fn ds_pop(forth: &mut ForthMachine) -> Result<isize, ForthError> {
+    forth.data_stack().pop().ok_or(ForthError::DataStackEmpty)
+}
+fn ds_push(forth: &mut ForthMachine, val: isize) -> Result<(), ForthError> {
+    forth
+        .data_stack()
+        .push(val)
+        .ok_or(ForthError::DataStackLimitReached)
+}
+fn ds_last(forth: &mut ForthMachine) -> Result<isize, ForthError> {
+    forth
+        .data_stack()
+        .last()
+        .copied()
+        .ok_or(ForthError::DataStackEmpty)
+}
+
+fn rs_pop(forth: &mut ForthMachine) -> Result<isize, ForthError> {
+    forth
+        .return_stack()
+        .pop()
+        .ok_or(ForthError::ReturnStackEmpty)
+}
+fn rs_push(forth: &mut ForthMachine, val: isize) -> Result<(), ForthError> {
+    forth
+        .return_stack()
+        .push(val)
+        .ok_or(ForthError::ReturnStackLimitReached)
+}
+fn rs_last(forth: &mut ForthMachine) -> Result<isize, ForthError> {
+    forth
+        .return_stack()
+        .last()
+        .copied()
+        .ok_or(ForthError::ReturnStackEmpty)
+}
+
+fn bye_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
     forth.instruction_addr = 0;
+    Ok(())
 }
 
-fn drop_builtin(forth: &mut ForthMachine) {
-    forth.data_stack().pop().unwrap();
+fn drop_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    ds_pop(forth)?;
+    Ok(())
 }
 
-fn nip_builtin(forth: &mut ForthMachine) {
-    let val = forth.data_stack().pop().unwrap();
-    *forth.data_stack().last_mut().unwrap() = val;
+fn nip_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let val = ds_pop(forth)?;
+    let mut ds = forth.data_stack();
+    *ds.last_mut().ok_or(ForthError::DataStackEmpty)? = val;
+    Ok(())
 }
 
-fn dup_builtin(forth: &mut ForthMachine) {
-    let last_val = *forth.data_stack().last().unwrap();
-    forth.data_stack().push(last_val).unwrap();
+fn dup_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let val = ds_last(forth)?;
+    ds_push(forth, val)
 }
 
-fn swap_builtin(forth: &mut ForthMachine) {
-    let mut data_stack = forth.data_stack();
-    let a = data_stack.pop().unwrap();
-    let b = data_stack.pop().unwrap();
-    data_stack.push(a).unwrap();
-    data_stack.push(b).unwrap();
+fn swap_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let a = ds_pop(forth)?;
+    let b = ds_pop(forth)?;
+    ds_push(forth, a)?;
+    ds_push(forth, b)
 }
 
-fn rot_builtin(forth: &mut ForthMachine) {
-    let mut data_stack = forth.data_stack();
-    let a = data_stack.pop().unwrap();
-    let b = data_stack.pop().unwrap();
-    let c = data_stack.pop().unwrap();
-    data_stack.push(b).unwrap();
-    data_stack.push(a).unwrap();
-    data_stack.push(c).unwrap();
+fn rot_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let a = ds_pop(forth)?;
+    let b = ds_pop(forth)?;
+    let c = ds_pop(forth)?;
+    ds_push(forth, b)?;
+    ds_push(forth, a)?;
+    ds_push(forth, c)
 }
 
 // DOCOL is special, it is a codeword and as such its direct address should be
 // used when creating new words.
 // TODO: Maybe make a DOCOL word (constant) that pushes this address on stack.
-fn docol(forth: &mut ForthMachine) {
+fn docol(forth: &mut ForthMachine) -> Result<(), ForthError> {
     let ret_addr = forth.instruction_addr as isize;
-    forth.return_stack().push(ret_addr).unwrap();
-    forth.instruction_addr = forth.curr_def_addr.checked_add(PTR_SIZE).unwrap();
+    rs_push(forth, ret_addr)?;
+    forth.instruction_addr = forth
+        .curr_def_addr
+        .checked_add(PTR_SIZE)
+        .ok_or(ForthError::AddressOverflow(forth.curr_def_addr))?;
+    Ok(())
 }
 
-fn exit_builtin(forth: &mut ForthMachine) {
-    forth.instruction_addr = forth.return_stack().pop().unwrap() as usize;
+fn exit_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    forth.instruction_addr = rs_pop(forth)? as usize;
+    Ok(())
 }
 
-fn refill_builtin(forth: &mut ForthMachine) {
+fn refill_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
     let mut line = String::with_capacity(INPUT_BUFFER_SIZE);
     if let Ok(num_read) = std::io::stdin().read_line(&mut line) {
+        if num_read > INPUT_BUFFER_SIZE {
+            return Err(ForthError::InputBufferLimitReached);
+        }
         assert!(num_read <= INPUT_BUFFER_SIZE);
         if num_read > 0 {
             assert_eq!(
@@ -726,22 +801,21 @@ fn refill_builtin(forth: &mut ForthMachine) {
             );
             forth.curr_input_len = num_read;
             forth.set_curr_input_ix(0);
-            forth.data_stack().push(FORTH_TRUE).unwrap();
-            return;
+            return ds_push(forth, FORTH_TRUE);
         }
     }
-    forth.data_stack().push(FORTH_FALSE).unwrap();
+    ds_push(forth, FORTH_FALSE)
 }
 
-fn source_builtin(forth: &mut ForthMachine) {
+fn source_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
     let ptr = forth.input_buffer_ptr;
-    forth.data_stack().push(ptr as isize).unwrap();
+    ds_push(forth, ptr as isize)?;
     let len = forth.curr_input_len;
-    forth.data_stack().push(len as isize).unwrap();
+    ds_push(forth, len as isize)
 }
 
 fn read_input_byte(forth: &mut ForthMachine) -> Option<u8> {
-    if forth.curr_input_ix() == forth.curr_input_len {
+    if forth.curr_input_ix() >= forth.curr_input_len {
         None
     } else {
         let curr_ix = forth.curr_input_ix();
@@ -753,15 +827,17 @@ fn read_input_byte(forth: &mut ForthMachine) -> Option<u8> {
     }
 }
 
-fn emit_builtin(forth: &mut ForthMachine) {
-    let v = forth.data_stack().pop().unwrap() as u8;
+fn emit_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let v = ds_pop(forth)? as u8;
     assert_eq!(std::io::stdout().write(&[v]).unwrap(), 1);
+    Ok(())
 }
 
 // ( "ccc<eol>" -- )
 // Parses and discards \ comments
-fn backslash_builtin(forth: &mut ForthMachine) {
-    forth.set_curr_input_ix(forth.curr_input_len)
+fn backslash_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    forth.set_curr_input_ix(forth.curr_input_len);
+    Ok(())
 }
 
 const BLANK_CHARS: [char; 3] = [' ', '\t', '\n'];
@@ -770,7 +846,7 @@ const BLANK_CHARS: [char; 3] = [' ', '\t', '\n'];
 //
 // Skip leading white space and parse `name` delimited by a white space.
 // NOTE: Behaves like standard PARSE-NAME, not like WORD.
-fn word_builtin(forth: &mut ForthMachine) {
+fn word_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
     let (ptr, len) = match do_word_builtin(forth) {
         None => (
             unsafe { forth.input_buffer_ptr.add(INPUT_BUFFER_SIZE) as *const u8 },
@@ -778,8 +854,8 @@ fn word_builtin(forth: &mut ForthMachine) {
         ),
         Some((ptr, len)) => (ptr, len),
     };
-    forth.data_stack().push(ptr as isize).unwrap();
-    forth.data_stack().push(len as isize).unwrap();
+    ds_push(forth, ptr as isize)?;
+    ds_push(forth, len as isize)
 }
 fn do_word_builtin(forth: &mut ForthMachine) -> Option<(*const u8, usize)> {
     let mut byte = read_input_byte(forth)?;
@@ -803,34 +879,39 @@ fn do_word_builtin(forth: &mut ForthMachine) -> Option<(*const u8, usize)> {
     Some((start_ptr, len as usize))
 }
 
-fn store_builtin(forth: &mut ForthMachine) {
-    let ptr = forth.data_stack().pop().unwrap() as *mut isize;
-    assert!(forth.data_space.is_valid_ptr(ptr));
-    let val = forth.data_stack().pop().unwrap();
-    let addr_ref = unsafe { ptr.as_mut().unwrap() };
-    *addr_ref = val
+fn check_ptr<T>(forth: &ForthMachine, ptr: *const T) -> Result<(), ForthError> {
+    if !forth.data_space.is_valid_ptr(ptr) {
+        return Err(ForthError::InvalidPointer(ptr as usize));
+    }
+    Ok(())
 }
 
-fn fetch_builtin(forth: &mut ForthMachine) {
-    let ptr = forth.data_stack().pop().unwrap() as *const isize;
-    assert!(forth.data_space.is_valid_ptr(ptr));
-    let addr_ref = unsafe { ptr.as_ref().unwrap() };
-    forth.data_stack().push(*addr_ref).unwrap()
+fn store_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let ptr = ds_pop(forth)? as *mut isize;
+    check_ptr(forth, ptr)?;
+    let val = ds_pop(forth)?;
+    unsafe { *ptr = val };
+    Ok(())
+}
+fn store_byte_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let ptr = ds_pop(forth)? as *mut u8;
+    check_ptr(forth, ptr)?;
+    let val = ds_pop(forth)? as u8;
+    unsafe { *ptr = val };
+    Ok(())
 }
 
-fn store_byte_builtin(forth: &mut ForthMachine) {
-    let ptr = forth.data_stack().pop().unwrap() as *mut u8;
-    assert!(forth.data_space.is_valid_ptr(ptr));
-    let val = forth.data_stack().pop().unwrap() as u8;
-    let addr_ref = unsafe { ptr.as_mut().unwrap() };
-    *addr_ref = val
+fn fetch_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let ptr = ds_pop(forth)? as *const isize;
+    check_ptr(forth, ptr)?;
+    let val = unsafe { *ptr };
+    ds_push(forth, val)
 }
-
-fn fetch_byte_builtin(forth: &mut ForthMachine) {
-    let ptr = forth.data_stack().pop().unwrap() as *const u8;
-    assert!(forth.data_space.is_valid_ptr(ptr));
-    let addr_ref = unsafe { ptr.as_ref().unwrap() };
-    forth.data_stack().push(*addr_ref as isize).unwrap()
+fn fetch_byte_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let ptr = ds_pop(forth)? as *const u8;
+    check_ptr(forth, ptr)?;
+    let val = unsafe { *ptr };
+    ds_push(forth, val as isize)
 }
 
 fn parse_num(src: &str, radix: u32) -> Result<isize, std::num::ParseIntError> {
@@ -850,121 +931,139 @@ fn parse_num(src: &str, radix: u32) -> Result<isize, std::num::ParseIntError> {
 // Converts string to number, flag indicates success.
 // (addr u - n f)
 // NOTE: Based on Gforth's S>NUMBER?, but we return a single cell number.
-fn s_to_number_builtin(forth: &mut ForthMachine) {
-    let byte_len = forth.data_stack().pop().unwrap() as usize;
-    let ptr = forth.data_stack().pop().unwrap() as *const u8;
+fn s_to_number_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let byte_len = ds_pop(forth)? as usize;
+    let ptr = ds_pop(forth)? as *const u8;
     if byte_len == 0 {
-        forth.data_stack().push(0).unwrap();
-        forth.data_stack().push(FORTH_FALSE).unwrap();
-        return;
+        ds_push(forth, 0)?;
+        return ds_push(forth, FORTH_FALSE);
     }
-    assert!(forth.data_space.is_valid_ptr(ptr));
-    assert!(forth
-        .data_space
-        .is_valid_ptr((ptr as usize + byte_len - 1) as *const u8));
+    check_ptr(forth, ptr)?;
+    check_ptr(forth, (ptr as usize + byte_len - 1) as *const u8)?;
     let bytes = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
     // TODO: Use BASE variable for parsing.
     let base = 10;
-    match parse_num(std::str::from_utf8(bytes).unwrap(), base) {
+    let name = std::str::from_utf8(bytes).map_err(|_| ForthError::InvalidStringEncoding)?;
+    match parse_num(name, base) {
         Ok(num) => {
-            forth.data_stack().push(num).unwrap();
-            forth.data_stack().push(FORTH_TRUE).unwrap();
+            ds_push(forth, num)?;
+            ds_push(forth, FORTH_TRUE)
         }
         _ => {
-            forth.data_stack().push(0).unwrap();
-            forth.data_stack().push(FORTH_FALSE).unwrap();
+            ds_push(forth, 0)?;
+            ds_push(forth, FORTH_FALSE)
         }
     }
 }
 
 // Return name token (start of dict entry) or 0.
 // (addr u - nt | 0)
-fn find_builtin(forth: &mut ForthMachine) {
-    let byte_len = forth.data_stack().pop().unwrap() as usize;
-    let ptr = forth.data_stack().pop().unwrap() as *const u8;
-    assert!(forth.data_space.is_valid_ptr(ptr));
-    assert!(forth
-        .data_space
-        .is_valid_ptr((ptr as usize + byte_len - 1) as *const u8));
+fn find_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let byte_len = ds_pop(forth)? as usize;
+    let ptr = ds_pop(forth)? as *const u8;
+    check_ptr(forth, ptr)?;
+    check_ptr(forth, (ptr as usize + byte_len - 1) as *const u8)?;
     let bytes = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
-    let name = std::str::from_utf8(bytes).unwrap();
+    let name = std::str::from_utf8(bytes).map_err(|_| ForthError::InvalidStringEncoding)?;
     match forth.data_space.find_entry(name) {
-        None => forth.data_stack().push(0).unwrap(),
+        None => ds_push(forth, 0),
         Some(dict_entry_ref) => {
             let dict_entry_addr = dict_entry_ref.ptr as *const u8 as isize;
-            forth.data_stack().push(dict_entry_addr).unwrap()
+            ds_push(forth, dict_entry_addr)
         }
     }
 }
 
-fn latest_builtin(forth: &mut ForthMachine) {
+fn latest_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
     let dict_head_addr = forth.data_space.dict_head as isize;
-    forth.data_stack().push(dict_head_addr).unwrap()
+    ds_push(forth, dict_head_addr)
 }
 
 // Return Code Field Address (i.e. definition address of a dict entry).
-fn to_cfa_builtin(forth: &mut ForthMachine) {
-    let ptr = forth.data_stack().pop().unwrap() as *mut u8;
+fn to_cfa_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let ptr = ds_pop(forth)? as *mut u8;
     let dict_entry_ref = DictEntryRef {
         data_space: &forth.data_space,
         ptr,
     };
     let def_addr = dict_entry_ref.definition_addr() as isize;
-    forth.data_stack().push(def_addr).unwrap();
+    ds_push(forth, def_addr)
 }
 
-fn hidden_builtin(forth: &mut ForthMachine) {
-    let ptr = forth.data_stack().pop().unwrap() as *mut u8;
+fn hidden_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let ptr = ds_pop(forth)? as *mut u8;
     let mut dict_entry_ref = DictEntryRef {
         data_space: &forth.data_space,
         ptr,
     };
     dict_entry_ref.toggle_hidden();
+    Ok(())
 }
 
-fn immediate_builtin(forth: &mut ForthMachine) {
-    forth.data_space.latest_entry().unwrap().toggle_immediate();
+fn immediate_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    forth
+        .data_space
+        .latest_entry()
+        .ok_or(ForthError::NoLatestEntry)?
+        .toggle_immediate();
+    Ok(())
 }
 
-fn branch_builtin(forth: &mut ForthMachine) {
+fn branch_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
     let ptr_to_offset = forth.instruction_addr as *const isize;
-    assert!(forth.data_space.is_valid_ptr(ptr_to_offset));
+    check_ptr(forth, ptr_to_offset)?;
     let offset = unsafe { *ptr_to_offset };
     if offset >= 0 {
-        forth.instruction_addr = forth.instruction_addr.checked_add(offset as usize).unwrap();
+        forth.instruction_addr = forth
+            .instruction_addr
+            .checked_add(offset as usize)
+            .ok_or(ForthError::AddressOverflow(forth.instruction_addr))?;
+        Ok(())
     } else {
         forth.instruction_addr = forth
             .instruction_addr
             .checked_sub(offset.unsigned_abs())
-            .unwrap();
+            .ok_or(ForthError::AddressOverflow(forth.instruction_addr))?;
+        Ok(())
     }
 }
 
-fn zbranch_builtin(forth: &mut ForthMachine) {
-    let val = forth.data_stack().pop().unwrap();
+fn zbranch_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let val = ds_pop(forth)?;
     if val == 0 {
-        branch_builtin(forth);
+        branch_builtin(forth)
     } else {
-        forth.instruction_addr = forth.instruction_addr.checked_add(PTR_SIZE).unwrap();
+        forth.instruction_addr = forth
+            .instruction_addr
+            .checked_add(PTR_SIZE)
+            .ok_or(ForthError::AddressOverflow(forth.instruction_addr))?;
+        Ok(())
     }
 }
 
-fn lit_builtin(forth: &mut ForthMachine) {
+fn lit_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
     let ptr_to_val = forth.instruction_addr as *const isize;
-    assert!(forth.data_space.is_valid_ptr(ptr_to_val));
+    check_ptr(forth, ptr_to_val)?;
     let val = unsafe { *ptr_to_val };
     // println!("val: {:#x}", val);
-    forth.instruction_addr = forth.instruction_addr.checked_add(PTR_SIZE).unwrap();
-    forth.data_stack().push(val).unwrap();
+    forth.instruction_addr = forth
+        .instruction_addr
+        .checked_add(PTR_SIZE)
+        .ok_or(ForthError::AddressOverflow(forth.instruction_addr))?;
+    ds_push(forth, val)
 }
 
-fn allot_builtin(forth: &mut ForthMachine) {
-    let bytes = forth.data_stack().pop().unwrap();
+fn allot_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let bytes = ds_pop(forth)?;
     if bytes > 0 {
-        forth.data_space.alloc(bytes as usize).unwrap();
-    } else if bytes < 0 {
-        assert!(forth.data_space.dealloc(bytes.unsigned_abs()));
+        forth
+            .data_space
+            .alloc(bytes as usize)
+            .ok_or(ForthError::AllocFailed)?;
+    } else if bytes < 0 && !forth.data_space.dealloc(bytes.unsigned_abs()) {
+        return Err(ForthError::DeallocFailed);
     }
+    Ok(())
 }
 
 // `CREATE` is a bit special, it will allocate a dict entry, but will set the
@@ -973,89 +1072,91 @@ fn allot_builtin(forth: &mut ForthMachine) {
 // with `DOES>`. What follows the allocated dict entry is the space for data
 // fields. This address can be obtained via `>BODY`.
 // NOTE: `DOES>` & `>BODY` are implemented in rforth.fs
-fn create_builtin(forth: &mut ForthMachine) {
-    let (ptr, byte_len) = do_word_builtin(forth).unwrap();
-    assert!(forth.data_space.is_valid_ptr(ptr));
-    assert!(forth
-        .data_space
-        .is_valid_ptr((ptr as usize + byte_len - 1) as *const u8));
+fn create_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let (ptr, byte_len) = do_word_builtin(forth).ok_or(ForthError::CreateMissingWord)?;
+    check_ptr(forth, ptr)?;
+    check_ptr(forth, (ptr as usize + byte_len - 1) as *const u8)?;
     let bytes = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
-    let name = std::str::from_utf8(bytes).unwrap();
+    let name = std::str::from_utf8(bytes).map_err(|_| ForthError::InvalidStringEncoding)?;
     // println!("Pushing '{}' to dict", name);
+    // TODO: These should have AllocFailed errors
     assert!(forth.data_space.push_dict_entry(name, 0));
     push_instruction(&mut forth.data_space, docreate as usize);
     push_instruction(&mut forth.data_space, 0);
+    Ok(())
 }
 
 // DOCREATE is a special codeword, it will push the address of the start of the
 // dict entry's data fields on the data stack. If the `ptr` after the codeword
 // is not 0, it will then set the next instruction to be found at that `ptr`.
 // This way we implement run-time semantics of a CREATEd word that has DOES>.
-fn docreate(forth: &mut ForthMachine) {
-    assert!(
-        forth
-            .data_space
-            .is_valid_ptr(forth.curr_def_addr as *const usize),
-        "'{addr:#x} ({addr})' is not a valid ptr",
-        addr = forth.curr_def_addr,
-    );
+fn docreate(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    check_ptr(forth, forth.curr_def_addr as *const usize)?;
     let fun_addr = unsafe { *(forth.curr_def_addr as *const usize) };
     // Sanity check that forth.curr_def_addr is indeed the dict entry we are
     // executing in.
     assert_eq!(fun_addr, docreate as usize);
-    let instr_addr_ptr = forth.curr_def_addr.checked_add(PTR_SIZE).unwrap() as *const usize;
-    assert!(forth.data_space.is_valid_ptr(instr_addr_ptr));
-    let data_addr = (instr_addr_ptr as usize).checked_add(PTR_SIZE).unwrap();
-    forth.data_stack().push(data_addr as isize).unwrap();
+    let instr_addr_ptr = forth
+        .curr_def_addr
+        .checked_add(PTR_SIZE)
+        .ok_or(ForthError::AddressOverflow(forth.curr_def_addr))?
+        as *const usize;
+    check_ptr(forth, instr_addr_ptr)?;
+    let data_addr = (instr_addr_ptr as usize)
+        .checked_add(PTR_SIZE)
+        .ok_or(ForthError::AddressOverflow(instr_addr_ptr as usize))?;
+    ds_push(forth, data_addr as isize)?;
     let instr_addr = unsafe { *instr_addr_ptr };
     if instr_addr != 0 {
         let ret_addr = forth.instruction_addr as isize;
-        forth.return_stack().push(ret_addr).unwrap();
+        rs_push(forth, ret_addr)?;
         forth.instruction_addr = instr_addr;
     }
+    Ok(())
 }
 
-fn comma_builtin(forth: &mut ForthMachine) {
-    let def_addr = forth.data_stack().pop().unwrap();
+fn comma_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let def_addr = ds_pop(forth)?;
     push_instruction(&mut forth.data_space, def_addr as usize);
+    Ok(())
 }
 
-fn lbrac_builtin(forth: &mut ForthMachine) {
+fn lbrac_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
     forth.state = ForthState::Immediate;
+    Ok(())
 }
 
-fn rbrac_builtin(forth: &mut ForthMachine) {
+fn rbrac_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
     forth.state = ForthState::Compile;
+    Ok(())
 }
 
 // Interpret a *single* word in the parse area (if available).
-fn interpret_single_builtin(forth: &mut ForthMachine) {
+fn interpret_single_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
     let (ptr, byte_len) = match do_word_builtin(forth) {
-        None => return,
+        None => return Ok(()),
         Some((ptr, byte_len)) => (ptr, byte_len),
     };
-    assert!(forth.data_space.is_valid_ptr(ptr));
-    assert!(forth
-        .data_space
-        .is_valid_ptr((ptr as usize + byte_len - 1) as *const u8));
+    check_ptr(forth, ptr)?;
+    check_ptr(forth, (ptr as usize + byte_len - 1) as *const u8)?;
     let bytes = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
-    let name = std::str::from_utf8(bytes).unwrap();
+    let name = std::str::from_utf8(bytes).map_err(|_| ForthError::InvalidStringEncoding)?;
     if let Some(dict_entry_ref) = forth.data_space.find_entry(name) {
         // dbg!(dict_entry_ref);
         if dict_entry_ref.is_immediate() || forth.state == ForthState::Immediate {
-            exec_fun_indirect(dict_entry_ref.definition_addr(), forth);
+            exec_fun_indirect(dict_entry_ref.definition_addr(), forth)
         } else {
             // Compiling
             let def_addr = dict_entry_ref.definition_addr();
             push_instruction(&mut forth.data_space, def_addr);
+            Ok(())
         }
     } else {
         // TODO: Use BASE variable for parsing.
         let base = 10;
-        let num = parse_num(name, base)
-            .unwrap_or_else(|_| panic!("Unable to parse '{}' as number", name));
+        let num = parse_num(name, base).map_err(|_| ForthError::ParseNum(name.to_string()))?;
         match forth.state {
-            ForthState::Immediate => forth.data_stack().push(num).unwrap(),
+            ForthState::Immediate => ds_push(forth, num),
             ForthState::Compile => {
                 let lit = forth
                     .data_space
@@ -1064,173 +1165,164 @@ fn interpret_single_builtin(forth: &mut ForthMachine) {
                     .definition_addr();
                 push_instruction(&mut forth.data_space, lit);
                 push_instruction(&mut forth.data_space, num as usize);
+                Ok(())
             }
         }
     }
 }
 
-fn rs_clear_builtin(forth: &mut ForthMachine) {
+fn rs_clear_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
     forth.return_stack().clear();
+    Ok(())
 }
 
-fn execute_builtin(forth: &mut ForthMachine) {
-    let def_addr = forth.data_stack().pop().unwrap() as usize;
-    exec_fun_indirect(def_addr, forth);
+fn execute_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let def_addr = ds_pop(forth)? as usize;
+    exec_fun_indirect(def_addr, forth)
 }
 
-fn here_builtin(forth: &mut ForthMachine) {
+fn here_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
     let here_addr = forth.data_space.here() as isize;
-    forth.data_stack().push(here_addr).unwrap();
+    ds_push(forth, here_addr)
 }
 
-fn align_builtin(forth: &mut ForthMachine) {
-    assert!(forth.data_space.align());
+fn align_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    if !forth.data_space.align() {
+        return Err(ForthError::AllocFailed);
+    }
+    Ok(())
 }
 
-fn unused_builtin(forth: &mut ForthMachine) {
+fn unused_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
     let unused = forth.data_space.unused() as isize;
-    forth.data_stack().push(unused).unwrap();
+    ds_push(forth, unused)
 }
 
-fn cells_builtin(forth: &mut ForthMachine) {
-    let n = forth.data_stack().pop().unwrap();
-    forth
-        .data_stack()
-        .push(n.wrapping_mul(PTR_SIZE as isize))
-        .unwrap()
+fn cells_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let n = ds_pop(forth)?;
+    ds_push(forth, n.wrapping_mul(PTR_SIZE as isize))
 }
 
-fn add_builtin(forth: &mut ForthMachine) {
-    let mut data_stack = forth.data_stack();
-    let b = data_stack.pop().unwrap();
-    let a = data_stack.last_mut().unwrap();
+fn add_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let b = ds_pop(forth)?;
+    let mut ds = forth.data_stack();
+    let a = ds.last_mut().ok_or(ForthError::DataStackEmpty)?;
     *a = a.wrapping_add(b);
+    Ok(())
 }
 
-fn sub_builtin(forth: &mut ForthMachine) {
-    let mut data_stack = forth.data_stack();
-    let b = data_stack.pop().unwrap();
-    let a = data_stack.last_mut().unwrap();
+fn sub_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let b = ds_pop(forth)?;
+    let mut ds = forth.data_stack();
+    let a = ds.last_mut().ok_or(ForthError::DataStackEmpty)?;
     *a = a.wrapping_sub(b);
+    Ok(())
 }
 
-fn mul_builtin(forth: &mut ForthMachine) {
-    let mut data_stack = forth.data_stack();
-    let b = data_stack.pop().unwrap();
-    let a = data_stack.last_mut().unwrap();
+fn mul_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let b = ds_pop(forth)?;
+    let mut ds = forth.data_stack();
+    let a = ds.last_mut().ok_or(ForthError::DataStackEmpty)?;
     *a = a.wrapping_mul(b);
+    Ok(())
 }
 
-fn slash_mod_builtin(forth: &mut ForthMachine) {
-    let mut data_stack = forth.data_stack();
-    let b = data_stack.pop().unwrap();
-    let a = data_stack.pop().unwrap();
-    assert_ne!(b, 0, "division by zero");
-    data_stack.push(a % b).unwrap();
-    data_stack.push(a / b).unwrap();
+fn slash_mod_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let b = ds_pop(forth)?;
+    let a = ds_pop(forth)?;
+    if b == 0 {
+        return Err(ForthError::DivByZero);
+    }
+    ds_push(forth, a % b)?;
+    ds_push(forth, a / b)
 }
 
-fn abs_builtin(forth: &mut ForthMachine) {
-    let mut data_stack = forth.data_stack();
-    let a = data_stack.pop().unwrap();
-    data_stack.push(a.unsigned_abs() as isize).unwrap();
+fn abs_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let a = ds_pop(forth)?;
+    ds_push(forth, a.unsigned_abs() as isize)
 }
 
-fn invert_builtin(forth: &mut ForthMachine) {
-    let mut data_stack = forth.data_stack();
-    let a = data_stack.pop().unwrap();
-    data_stack.push(!a).unwrap();
+fn invert_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let a = ds_pop(forth)?;
+    ds_push(forth, !a)
 }
 
-fn and_builtin(forth: &mut ForthMachine) {
-    let mut data_stack = forth.data_stack();
-    let b = data_stack.pop().unwrap() as usize;
-    let a = data_stack.pop().unwrap() as usize;
-    data_stack.push((a & b) as isize).unwrap();
+fn and_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let b = ds_pop(forth)? as usize;
+    let a = ds_pop(forth)? as usize;
+    ds_push(forth, (a & b) as isize)
 }
 
-fn or_builtin(forth: &mut ForthMachine) {
-    let mut data_stack = forth.data_stack();
-    let b = data_stack.pop().unwrap() as usize;
-    let a = data_stack.pop().unwrap() as usize;
-    data_stack.push((a | b) as isize).unwrap();
+fn or_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let b = ds_pop(forth)? as usize;
+    let a = ds_pop(forth)? as usize;
+    ds_push(forth, (a | b) as isize)
 }
 
-fn xor_builtin(forth: &mut ForthMachine) {
-    let mut data_stack = forth.data_stack();
-    let b = data_stack.pop().unwrap() as usize;
-    let a = data_stack.pop().unwrap() as usize;
-    data_stack.push((a ^ b) as isize).unwrap();
+fn xor_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let b = ds_pop(forth)? as usize;
+    let a = ds_pop(forth)? as usize;
+    ds_push(forth, (a ^ b) as isize)
 }
 
-fn lshift_builtin(forth: &mut ForthMachine) {
-    let mut data_stack = forth.data_stack();
-    let b = data_stack.pop().unwrap() as usize;
-    let a = data_stack.pop().unwrap() as usize;
-    data_stack.push((a << b) as isize).unwrap();
+fn lshift_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let b = ds_pop(forth)? as usize;
+    let a = ds_pop(forth)? as usize;
+    ds_push(forth, (a << b) as isize)
 }
 
-fn rshift_builtin(forth: &mut ForthMachine) {
-    let mut data_stack = forth.data_stack();
-    let b = data_stack.pop().unwrap() as usize;
-    let a = data_stack.pop().unwrap() as usize;
-    data_stack.push((a >> b) as isize).unwrap();
+fn rshift_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let b = ds_pop(forth)? as usize;
+    let a = ds_pop(forth)? as usize;
+    ds_push(forth, (a >> b) as isize)
 }
 
-fn eq_builtin(forth: &mut ForthMachine) {
-    let mut data_stack = forth.data_stack();
-    let b = data_stack.pop().unwrap();
-    let a = data_stack.pop().unwrap();
-    data_stack
-        .push(if a == b { FORTH_TRUE } else { FORTH_FALSE })
-        .unwrap();
+fn eq_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let b = ds_pop(forth)?;
+    let a = ds_pop(forth)?;
+    ds_push(forth, if a == b { FORTH_TRUE } else { FORTH_FALSE })
 }
 
-fn greater_than_builtin(forth: &mut ForthMachine) {
-    let mut data_stack = forth.data_stack();
-    let b = data_stack.pop().unwrap();
-    let a = data_stack.pop().unwrap();
-    data_stack
-        .push(if a > b { FORTH_TRUE } else { FORTH_FALSE })
-        .unwrap();
+fn greater_than_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let b = ds_pop(forth)?;
+    let a = ds_pop(forth)?;
+    ds_push(forth, if a > b { FORTH_TRUE } else { FORTH_FALSE })
 }
 
-fn u_greater_than_builtin(forth: &mut ForthMachine) {
-    let mut data_stack = forth.data_stack();
-    let b = data_stack.pop().unwrap() as usize;
-    let a = data_stack.pop().unwrap() as usize;
-    data_stack
-        .push(if a > b { FORTH_TRUE } else { FORTH_FALSE })
-        .unwrap();
+fn u_greater_than_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let b = ds_pop(forth)? as usize;
+    let a = ds_pop(forth)? as usize;
+    ds_push(forth, if a > b { FORTH_TRUE } else { FORTH_FALSE })
 }
 
-fn to_rstack_builtin(forth: &mut ForthMachine) {
-    let ret_addr = forth.data_stack().pop().unwrap();
-    forth.return_stack().push(ret_addr).unwrap();
+fn to_rstack_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let ret_addr = ds_pop(forth)?;
+    rs_push(forth, ret_addr)
 }
 
-fn from_rstack_builtin(forth: &mut ForthMachine) {
-    let ret_addr = forth.return_stack().pop().unwrap();
-    forth.data_stack().push(ret_addr).unwrap();
+fn from_rstack_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let ret_addr = rs_pop(forth)?;
+    ds_push(forth, ret_addr)
 }
 
-fn rstack_fetch_builtin(forth: &mut ForthMachine) {
-    let ret_addr = *forth.return_stack().last().unwrap();
-    forth.data_stack().push(ret_addr).unwrap();
+fn rstack_fetch_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let ret_addr = rs_last(forth)?;
+    ds_push(forth, ret_addr)
 }
 
-fn print_data_stack_builtin(forth: &mut ForthMachine) {
+fn print_data_stack_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
     let data_stack = forth.data_stack();
     print!("<{}> ", data_stack.len());
     data_stack.iter().for_each(|v| {
         print!("{} ", v);
-    })
+    });
+    Ok(())
 }
 
-const SPECIAL_CODEWORDS: [(&str, fn(&mut ForthMachine)); 2] =
+const SPECIAL_CODEWORDS: [(&str, fn(&mut ForthMachine) -> Result<(), ForthError>); 2] =
     [("DOCOL", docol), ("DOCREATE", docreate)];
 
-const BUILTIN_WORDS: [(&str, u8, fn(&mut ForthMachine)); 55] = [
+const BUILTIN_WORDS: [(&str, u8, fn(&mut ForthMachine) -> Result<(), ForthError>); 55] = [
     // Stack manipulation
     (".S", 0, print_data_stack_builtin),
     ("DROP", 0, drop_builtin),
@@ -1299,14 +1391,10 @@ const BUILTIN_WORDS: [(&str, u8, fn(&mut ForthMachine)); 55] = [
     ("]", 0, rbrac_builtin),
 ];
 
-fn exec_fun_indirect(addr: usize, forth: &mut ForthMachine) {
+fn exec_fun_indirect(addr: usize, forth: &mut ForthMachine) -> Result<(), ForthError> {
     forth.curr_def_addr = addr;
     // println!("forth.curr_def_addr: {:#x}", forth.curr_def_addr);
-    assert!(
-        forth.data_space.is_valid_ptr(addr as *const usize),
-        "'{addr:#x} ({addr})' is not a valid ptr",
-        addr = addr,
-    );
+    check_ptr(forth, addr as *const usize)?;
     let fun_addr = unsafe { *(addr as *const usize) };
     let maybe_builtin = SPECIAL_CODEWORDS
         .iter()
@@ -1322,23 +1410,30 @@ fn exec_fun_indirect(addr: usize, forth: &mut ForthMachine) {
     //     None => println!("Executing fun at {:#x}", fun_addr),
     //     Some((name, _)) => println!("Executing '{}' ({:#x})", name, fun_addr),
     // }
-    assert!(maybe_builtin.is_some());
-    let fun = maybe_builtin.unwrap().1;
-    fun(forth)
+    let builtin = maybe_builtin.ok_or(ForthError::InvalidPointer(fun_addr))?;
+    let fun = builtin.1;
+    match fun(forth) {
+        e @ Err(..) => {
+            forth.backtrace.push(builtin.0.to_string());
+            e
+        }
+        r => r,
+    }
 }
 
-fn next(forth: &mut ForthMachine) {
+fn next(forth: &mut ForthMachine) -> Result<(), ForthError> {
     if forth.instruction_addr == 0 {
-        return;
+        return Ok(());
     }
-    assert!(forth
-        .data_space
-        .is_valid_ptr(forth.instruction_addr as *const usize));
+    check_ptr(forth, forth.instruction_addr as *const usize)?;
     let def_addr = unsafe { *(forth.instruction_addr as *const usize) };
-    forth.instruction_addr = forth.instruction_addr.checked_add(PTR_SIZE).unwrap();
+    forth.instruction_addr = forth
+        .instruction_addr
+        .checked_add(PTR_SIZE)
+        .ok_or(ForthError::AddressOverflow(forth.instruction_addr))?;
     // println!("curr_def_addr at {:#x}", def_addr);
     // println!("instruction_addr at {:#x}", forth.instruction_addr);
-    exec_fun_indirect(def_addr, forth);
+    exec_fun_indirect(def_addr, forth)
 }
 
 // Store instruction at `def_addr` and return the address in `data_space` where
@@ -1559,8 +1654,16 @@ pub fn run_with(forth: &mut ForthMachine, mut fun: impl FnMut(&mut ForthMachine)
     set_instruction(forth, "QUIT");
     println!("unused {} bytes", fmt_memsize(forth.data_space.unused()));
     while forth.instruction_addr != 0 {
-        next(forth);
+        if let Err(e) = next(forth) {
+            println!("ERROR: {:?}", e);
+            println!("  Backtrace");
+            for (ix, w) in forth.backtrace.iter().enumerate() {
+                println!("    {}: {}", ix, w);
+            }
+            forth.backtrace.clear();
+            set_instruction(forth, "QUIT");
+        }
         fun(forth);
     }
-    println!("\nBye!");
+    println!("Bye!");
 }

@@ -77,8 +77,8 @@ DOES>
 
 : IF IMMEDIATE
     ['] 0BRANCH , \ compile 0BRANCH
-    HERE \ @    \ save location of the offset on stack
-    0 ,         \ compile dummy offset
+    HERE          \ save location of the offset on stack
+    0 ,           \ compile dummy offset
 ;
 
 : THEN IMMEDIATE
@@ -89,10 +89,10 @@ DOES>
 
 : ELSE IMMEDIATE
     ['] BRANCH ,  \ definite branch to just over the false part
-    HERE        \ save location of the offset
-    0 ,         \ compile dummy offset
-    SWAP        \ now back-fill the original (IF) offset
-    DUP         \ same as for THEN above
+    HERE          \ save location of the offset
+    0 ,           \ compile dummy offset
+    SWAP          \ now back-fill the original (IF) offset
+    DUP           \ same as for THEN above
     HERE SWAP -
     SWAP !
 ;
