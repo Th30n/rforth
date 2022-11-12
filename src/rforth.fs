@@ -135,6 +135,8 @@ DOES>
 : 2DROP  DROP DROP ;
 \ ( x1 x2 -- x1 x2 x1 x2 )
 : 2DUP  OVER OVER ;
+\ ( x1 x2 x3 -- x3 x1 x2 )
+: -ROT  ROT ROT ;
 
 : 1-  1 - ;
 : 1+  1 + ;
@@ -144,6 +146,18 @@ DOES>
 : 0>  0 > ;
 : 0<  0 < ;
 : 0<> 0 <> ;
+
+: /  /MOD NIP ;
+
+\ n4 = (n1 * n2) / n3
+\ TODO: result of n1 * n2 should use double cell.
+\ ( n1 n2 n3 -- n4 )
+: */  >R * R> / ;
+
+\ n5 = (n1 * n2) / n3 + n4
+\ TODO: result of n1 * n2 should use double cell.
+\ ( n1 n2 n3 -- n4 n5 )
+: */MOD  >R * R> /MOD ;
 
 \ Add n|u to single cell number at a-addr
 \ ( n|u a-addr -- )
@@ -198,16 +212,36 @@ DOES>
 ( NOTE: Nesting is not supported       )
 ( ==================================== )
 
+\ Adjust the string `c-addr` by `n` characters.
+\     c-addr2 = c-addr1 + n
+\          u2 = u1 - n
+( c-addr1 u1 n -- c-addr2 u2 )
+: /STRING
+    ROT OVER + ( u1 n c-addr2 )
+    -ROT -
+;
+
 \ Display a character string.
 ( c-addr u -- )
 : TYPE
-    OVER + SWAP
-    BEGIN     ( end-addr c-addr )
-      2DUP U>
-    WHILE     ( end-addr c-addr )
-      DUP C@  ( end-addr c-addr char )
-      EMIT    ( end-addr c-addr )
-      1+      \ increment c-addr
-    REPEAT    ( end-addr c-addr )
+    BEGIN
+      DUP 0<>
+    WHILE  ( c-addr u )
+      OVER C@ EMIT
+      1 /STRING
+    REPEAT  ( c-addr' u' )
     2DROP
+;
+
+\ Store `char` in each of `u` consecutive characters of memory at `c-addr`.
+( c-addr u char -- )
+: FILL
+  >R BEGIN  ( c-addr u ) ( R: char )
+    DUP 0<>
+  WHILE
+    OVER R@ ( c-addr u c-addr char ) ( R: char )
+    SWAP C! ( c-addr u ) ( R: char )
+    1 /STRING
+  REPEAT    ( c-addr' u' ) ( R: char )
+  2DROP R> DROP
 ;
