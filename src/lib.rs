@@ -1489,7 +1489,7 @@ fn push_buffer(data_space: &mut DataSpace, name: &str, bytes: usize) -> *mut u8 
     // `docreate`. (See how `create_builtin` works).
     push_instruction(data_space, docreate as usize);
     push_instruction(data_space, 0);
-    let ptr = data_space.alloc(bytes).unwrap();
+    let ptr = data_space.alloc(bytes).expect("data space should have enough memory");
     assert!(data_space.align());
     ptr
 }
