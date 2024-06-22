@@ -1316,6 +1316,7 @@ fn print_data_stack_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> 
     data_stack.iter().for_each(|v| {
         print!("{} ", v);
     });
+    println!();
     Ok(())
 }
 
