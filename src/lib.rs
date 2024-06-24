@@ -1665,7 +1665,10 @@ pub fn run_with(forth: &mut ForthMachine, mut fun: impl FnMut(&mut ForthMachine)
         forth.return_stack.max_elements,
         fmt_memsize(forth.return_stack.max_elements * PTR_SIZE)
     );
+    // This needs to allocate a PTR_SIZE to store indirect address of QUIT.
     set_instruction(forth, "QUIT");
+    // We will reuse the allocated indirect address to reset the state on error.
+    let quit_instruction_addr = forth.instruction_addr;
     println!("unused {} bytes", fmt_memsize(forth.data_space.unused()));
     while forth.instruction_addr != 0 {
         if let Err(e) = next(forth) {
@@ -1675,7 +1678,22 @@ pub fn run_with(forth: &mut ForthMachine, mut fun: impl FnMut(&mut ForthMachine)
                 println!("    {}: {}", ix, w);
             }
             forth.backtrace.clear();
-            set_instruction(forth, "QUIT");
+            // Reset the instruction_addr back to QUIT.
+            {
+                // TODO: This allows for redefined QUIT, but that brings additional
+                // problems. Perhaps hard code it back to original QUIT.
+                let quit_def_addr = forth
+                    .data_space
+                    .find_entry("QUIT")
+                    .unwrap()
+                    .definition_addr();
+                let quit_instruction_buf = unsafe {
+                    std::slice::from_raw_parts_mut(quit_instruction_addr as *mut u8, PTR_SIZE)
+                };
+                let mut cursor = std::io::Cursor::new(quit_instruction_buf);
+                cursor.write_all(&quit_def_addr.to_ne_bytes()).unwrap();
+            }
+            forth.instruction_addr = quit_instruction_addr;
         }
         fun(forth);
     }
