@@ -1557,11 +1557,15 @@ fn fmt_memsize(bytes: usize) -> String {
 ///
 /// To pass a forth source code file, invoke with
 ///
-///     $ cat FORTH_FILE | rforth
+/// ```sh
+/// $ cat FORTH_FILE | rforth
+/// ```
 ///
 /// If you want to continue running the interpreter, use
 ///
-///     $ cat FORTH_FILE - | rforth
+/// ```sh
+/// $ cat FORTH_FILE - | rforth
+/// ```
 struct CliArgs {
     /// Size of total memory used for Forth's data space.
     ///
