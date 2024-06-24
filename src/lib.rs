@@ -2,6 +2,8 @@ use clap::Parser;
 use std::convert::TryFrom;
 use std::io::Write;
 
+// TODO: Switch to FORTH_CELL_SIZE and make it 32bit. The idea is for this to be a playground with
+// emulating old & limited hardware, so native 64bit is overkill. Maybe make it configurable?
 const PTR_SIZE: usize = std::mem::size_of::<usize>();
 
 fn is_aligned(addr: usize, alignment: usize) -> bool {
@@ -160,7 +162,7 @@ enum WordFlag {
 /// Definition list consists of | codeword | definition addr...
 ///
 /// The codeword is the native address to a function, so we call that directly.
-/// It is either a `docol`, `docreate` or some of the `*_builtin` functions.
+/// It is either a `DOCOL_IX`, `DOCREATE_IX` or an index into `BUILTIN_WORDS`.
 /// Remaining `definition addr` are pointers to the start of a `definition` in
 /// some other dict entry, i.e. word.
 #[derive(Copy, Clone)]
@@ -395,18 +397,13 @@ impl DataSpace {
         None
     }
 
-    pub fn push_builtin_word(
-        &mut self,
-        name: &str,
-        flags: u8,
-        word_fn: fn(&mut ForthMachine) -> Result<(), ForthError>,
-    ) {
+    pub fn push_builtin_word(&mut self, name: &str, flags: u8, word_ix: usize) {
         assert!(self.push_dict_entry(name, flags));
-        let fn_addr = word_fn as usize;
+        let word_ix = word_ix + SPECIAL_CODEWORDS.len();
         let ptr = self.alloc(PTR_SIZE).unwrap();
         let buf = unsafe { std::slice::from_raw_parts_mut(ptr, PTR_SIZE) };
         let mut cursor = std::io::Cursor::new(buf);
-        cursor.write_all(&fn_addr.to_ne_bytes()).unwrap();
+        cursor.write_all(&word_ix.to_ne_bytes()).unwrap();
     }
 }
 
@@ -639,8 +636,8 @@ impl ForthMachine {
         let data_stack = StackImpl::alloc(&mut data_space, data_stack_size);
         let return_stack = StackImpl::alloc(&mut data_space, return_stack_size);
         assert!(data_space.align());
-        for (name, flags, fun) in BUILTIN_WORDS {
-            data_space.push_builtin_word(name, flags, fun);
+        for (ix, (name, flags, _fun)) in BUILTIN_WORDS.iter().enumerate() {
+            data_space.push_builtin_word(name, *flags, ix);
         }
         Self {
             data_space,
@@ -770,8 +767,8 @@ fn rot_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
 }
 
 // DOCOL is special, it is a codeword and as such its direct address should be
-// used when creating new words.
-// TODO: Maybe make a DOCOL word (constant) that pushes this address on stack.
+// used when creating new words (via DOCOL_IX).
+// TODO: Maybe make a DOCOL word (constant) that pushes DOCOL_IX on stack.
 fn docol(forth: &mut ForthMachine) -> Result<(), ForthError> {
     let ret_addr = forth.instruction_addr as isize;
     rs_push(forth, ret_addr)?;
@@ -1093,7 +1090,7 @@ fn create_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
     // println!("Pushing '{}' to dict", name);
     // TODO: These should have AllocFailed errors
     assert!(forth.data_space.push_dict_entry(name, 0));
-    push_instruction(&mut forth.data_space, docreate as usize);
+    push_instruction(&mut forth.data_space, DOCREATE_IX);
     push_instruction(&mut forth.data_space, 0);
     Ok(())
 }
@@ -1107,7 +1104,7 @@ fn docreate(forth: &mut ForthMachine) -> Result<(), ForthError> {
     let fun_addr = unsafe { *(forth.curr_def_addr as *const usize) };
     // Sanity check that forth.curr_def_addr is indeed the dict entry we are
     // executing in.
-    assert_eq!(fun_addr, docreate as usize);
+    assert_eq!(fun_addr, DOCREATE_IX);
     let instr_addr_ptr = forth
         .curr_def_addr
         .checked_add(PTR_SIZE)
@@ -1332,6 +1329,8 @@ fn print_data_stack_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> 
     Ok(())
 }
 
+const DOCOL_IX: usize = 0;
+const DOCREATE_IX: usize = 1;
 const SPECIAL_CODEWORDS: [(&str, fn(&mut ForthMachine) -> Result<(), ForthError>); 2] =
     [("DOCOL", docol), ("DOCREATE", docreate)];
 
@@ -1409,22 +1408,21 @@ fn exec_fun_indirect(addr: usize, forth: &mut ForthMachine) -> Result<(), ForthE
     forth.curr_def_addr = addr;
     // println!("forth.curr_def_addr: {:#x}", forth.curr_def_addr);
     check_ptr(forth, addr as *const usize)?;
-    let fun_addr = unsafe { *(addr as *const usize) };
-    let maybe_builtin = SPECIAL_CODEWORDS
-        .iter()
-        .copied()
-        .chain(
-            BUILTIN_WORDS
-                .iter()
-                .map(|(name, _flags, fun)| (*name, *fun)),
-        )
-        .find(|(_, fun)| *fun as usize == fun_addr);
+    let word_ix = unsafe { *(addr as *const usize) };
+    let maybe_builtin = if word_ix < SPECIAL_CODEWORDS.len() {
+        Some(SPECIAL_CODEWORDS[word_ix])
+    } else if word_ix - SPECIAL_CODEWORDS.len() < BUILTIN_WORDS.len() {
+        let (name, _flags, fun) = BUILTIN_WORDS[word_ix - SPECIAL_CODEWORDS.len()];
+        Some((name, fun))
+    } else {
+        None
+    };
     // TODO: Setup debugging & tracing facilities.
     // match maybe_builtin {
-    //     None => println!("Executing fun at {:#x}", fun_addr),
-    //     Some((name, _)) => println!("Executing '{}' ({:#x})", name, fun_addr),
+    //     None => println!("Executing builtin fun at index {}", word_ix),
+    //     Some((name, _)) => println!("Executing builtin '{}' (index {})", name, word_ix),
     // }
-    let builtin = maybe_builtin.ok_or(ForthError::InvalidPointer(fun_addr))?;
+    let builtin = maybe_builtin.ok_or(ForthError::InvalidPointer(word_ix))?;
     let fun = builtin.1;
     match fun(forth) {
         e @ Err(..) => {
@@ -1466,7 +1464,7 @@ where
     I: IntoIterator<Item = &'a str>,
 {
     assert!(data_space.push_dict_entry(name, flags));
-    push_instruction(data_space, docol as usize);
+    push_instruction(data_space, DOCOL_IX);
     for word in words {
         match data_space.find_entry(word) {
             Some(entry) => {
@@ -1491,7 +1489,7 @@ fn push_variable(data_space: &mut DataSpace, name: &str, val: isize) -> *mut isi
     assert!(data_space.push_dict_entry(name, 0));
     // TODO: Add a builtin `dovar` to save extra space by avoiding the offset ptr for
     // `docreate`. (See how `create_builtin` works).
-    push_instruction(data_space, docreate as usize);
+    push_instruction(data_space, DOCREATE_IX);
     push_instruction(data_space, 0);
     push_instruction(data_space, val as usize) as *mut isize
 }
@@ -1500,9 +1498,11 @@ fn push_buffer(data_space: &mut DataSpace, name: &str, bytes: usize) -> *mut u8 
     assert!(data_space.push_dict_entry(name, 0));
     // TODO: Add a builtin `dovar` to save extra space by avoiding the offset ptr for
     // `docreate`. (See how `create_builtin` works).
-    push_instruction(data_space, docreate as usize);
+    push_instruction(data_space, DOCREATE_IX);
     push_instruction(data_space, 0);
-    let ptr = data_space.alloc(bytes).expect("data space should have enough memory");
+    let ptr = data_space
+        .alloc(bytes)
+        .expect("data space should have enough memory");
     assert!(data_space.align());
     ptr
 }
@@ -1594,7 +1594,7 @@ pub fn with_cli_args() -> ForthMachine {
             &(-(PTR_SIZE as isize)).to_string(),
             "ALLOT", // Deallocate the 0 ptr.
             "LIT",
-            &(docol as usize).to_string(),
+            &DOCOL_IX.to_string(),
             "LATEST", /* "@" */
             ">CFA",
             "!", // Overwrite `docreate` codeword with docol
