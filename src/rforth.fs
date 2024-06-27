@@ -245,3 +245,14 @@ DOES>
   REPEAT    ( c-addr' u' ) ( R: char )
   2DROP R> DROP
 ;
+
+\ Display all defined words.
+: WORDS
+  LATEST BEGIN  ( nt )
+    DUP CELL+ C@ $3F AND  \ Extract name length (see DICT_ENTRY_LEN_MASK in lib.rs)
+    OVER CELL+ 1 +        \ ( nt u c-addr ) get word name address
+    SWAP TYPE CR          \ ( nt )
+    @                     \ ( prev-nt )
+  DUP 0= UNTIL
+  DROP
+;

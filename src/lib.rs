@@ -196,6 +196,7 @@ fn test_memory_align() {
 }
 
 // Mask for fitting dict entry's name length, this can fit up to 63 bytes.
+// Note this mask is used in rforth.fs
 const DICT_ENTRY_LEN_MASK: u8 = 0x3f;
 // Flags must not overlap with the len mask.
 #[repr(u8)]
@@ -1096,18 +1097,6 @@ fn latest_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
     ds_push(forth, dict_head_addr)
 }
 
-// TODO: Add needed primitives to defined WORDS in Forth.
-fn words_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
-    let mut maybe_entry = forth.data_space.latest_entry();
-    while let Some(entry) = maybe_entry {
-        if !entry.is_hidden() {
-            println!("{}", entry.name());
-        }
-        maybe_entry = entry.prev();
-    }
-    Ok(())
-}
-
 // Return Code Field Address (i.e. definition address of a dict entry).
 fn to_cfa_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
     let ptr = ForthPtr(ds_pop(forth)? as ForthUCell);
@@ -1441,7 +1430,7 @@ const DOCREATE_IX: usize = 1;
 const SPECIAL_CODEWORDS: [(&str, fn(&mut ForthMachine) -> Result<(), ForthError>); 2] =
     [("DOCOL", docol), ("DOCREATE", docreate)];
 
-const BUILTIN_WORDS: [(&str, u8, fn(&mut ForthMachine) -> Result<(), ForthError>); 56] = [
+const BUILTIN_WORDS: [(&str, u8, fn(&mut ForthMachine) -> Result<(), ForthError>); 55] = [
     // Stack manipulation
     (".S", 0, print_data_stack_builtin),
     ("DROP", 0, drop_builtin),
@@ -1492,7 +1481,6 @@ const BUILTIN_WORDS: [(&str, u8, fn(&mut ForthMachine) -> Result<(), ForthError>
     ("HIDDEN", 0, hidden_builtin),
     ("IMMEDIATE", WordFlag::Immediate as u8, immediate_builtin),
     ("LATEST", 0, latest_builtin),
-    ("WORDS", 0, words_builtin),
     // Control flow
     ("BRANCH", 0, branch_builtin),
     ("0BRANCH", 0, zbranch_builtin),
