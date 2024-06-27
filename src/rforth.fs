@@ -74,6 +74,15 @@ DOES>
 \ ==================
 \ These only work inside compiled words. Typing in immediate mode (as presented
 \ by the interpreter) will result in an error.
+\
+\ Usage:
+\
+\ : X  ... test IF ... THEN ... ;
+\ : X  ... test IF ... ELSE ... THEN ... ;
+\
+\ : X  ... BEGIN ... test UNTIL ;
+\ : X  ... BEGIN ... test WHILE ... REPEAT ;
+\ : X  ... BEGIN ... AGAIN ;
 
 : IF IMMEDIATE
     ['] 0BRANCH , \ compile 0BRANCH
