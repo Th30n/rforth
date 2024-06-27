@@ -4,13 +4,13 @@ use std::convert::TryInto;
 use std::io::Write;
 
 /// Cell size in bytes.
-const FORTH_CELL_SIZE: ForthUCell = 2; // 16 bit
+pub const FORTH_CELL_SIZE: ForthUCell = 2; // 16 bit
 
 /// Cell type which fits FORTH_CELL_SIZE.
-type ForthCell = i16;
+pub type ForthCell = i16;
 
 /// Unsigned cell type which fits FORTH_CELL_SIZE.
-type ForthUCell = u16;
+pub type ForthUCell = u16;
 
 /// Forth address into data space.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -743,7 +743,7 @@ pub enum ForthError {
 
 #[derive(Debug)]
 pub struct ForthMachine {
-    data_space: DataSpace,
+    pub data_space: DataSpace,
     data_stack: StackImpl,
     return_stack: StackImpl,
     curr_def_addr: ForthPtr,
