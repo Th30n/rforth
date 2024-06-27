@@ -1,19 +1,69 @@
 use clap::Parser;
 use std::convert::TryFrom;
+use std::convert::TryInto;
 use std::io::Write;
 
-// TODO: Switch to FORTH_CELL_SIZE and make it 32bit. The idea is for this to be a playground with
-// emulating old & limited hardware, so native 64bit is overkill. Maybe make it configurable?
-const PTR_SIZE: usize = std::mem::size_of::<usize>();
+/// Cell size in bytes.
+const FORTH_CELL_SIZE: ForthUCell = 2; // 16 bit
+
+/// Cell type which fits FORTH_CELL_SIZE.
+type ForthCell = i16;
+
+/// Unsigned cell type which fits FORTH_CELL_SIZE.
+type ForthUCell = u16;
+
+/// Forth address into data space.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ForthPtr(ForthUCell);
+
+impl ForthPtr {
+    pub fn null() -> ForthPtr {
+        ForthPtr(0)
+    }
+
+    pub fn is_null(self) -> bool {
+        self.0 == 0
+    }
+
+    pub fn checked_add(self, offset: ForthUCell) -> Option<ForthPtr> {
+        self.0.checked_add(offset).map(ForthPtr)
+    }
+
+    pub fn checked_sub(self, offset: ForthUCell) -> Option<ForthPtr> {
+        self.0.checked_sub(offset).map(ForthPtr)
+    }
+
+    pub fn byte_offset(self, offset: isize) -> ForthPtr {
+        ForthPtr((self.0 as isize + offset).try_into().unwrap())
+    }
+
+    pub fn byte_offset_from(self, origin: ForthPtr) -> isize {
+        self.0 as isize - origin.0 as isize
+    }
+
+    pub fn align(self, alignment: ForthUCell) -> ForthPtr {
+        ForthPtr(
+            align_addr(self.0 as usize, alignment as usize)
+                .try_into()
+                .unwrap(),
+        )
+    }
+}
+
+impl std::fmt::Debug for ForthPtr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ForthPtr {{ {:#x } }}", self.0)
+    }
+}
 
 fn is_aligned(addr: usize, alignment: usize) -> bool {
     addr % alignment == 0
 }
 
-fn align_addr(addr: usize) -> usize {
-    assert_eq!(std::mem::align_of::<usize>(), PTR_SIZE);
-    let aligned_addr = (addr + (PTR_SIZE - 1)) & (!PTR_SIZE + 1);
-    assert!(is_aligned(aligned_addr, PTR_SIZE));
+fn align_addr(addr: usize, alignment: usize) -> usize {
+    assert!(alignment.is_power_of_two());
+    let aligned_addr = (addr + (alignment - 1)) & (!alignment + 1);
+    assert!(is_aligned(aligned_addr, alignment));
     assert!(aligned_addr >= addr);
     aligned_addr
 }
@@ -66,8 +116,8 @@ impl Memory {
     }
 
     #[must_use]
-    pub fn align(&mut self) -> bool {
-        let aligned_addr = align_addr(self.current as usize);
+    pub fn align(&mut self, alignment: usize) -> bool {
+        let aligned_addr = align_addr(self.current as usize, alignment);
         let end = self.ptr as usize + self.size();
         if aligned_addr >= end {
             return false;
@@ -126,21 +176,22 @@ impl Drop for Memory {
 
 #[test]
 fn test_memory_align() {
+    const RUST_PTR_SIZE: usize = std::mem::size_of::<usize>();
     let mut memory = Memory::with_size(1024);
     assert_eq!(memory.unused(), 1024);
-    assert!(memory.align());
+    assert!(memory.align(RUST_PTR_SIZE));
     assert_eq!(memory.unused(), 1024);
     memory.alloc(8);
     assert_eq!(memory.unused(), 1024 - 8);
-    assert!(memory.align());
+    assert!(memory.align(RUST_PTR_SIZE));
     assert_eq!(memory.unused(), 1024 - 8);
     memory.alloc(1);
     assert_eq!(memory.unused(), 1024 - 9);
-    assert!(memory.align());
+    assert!(memory.align(RUST_PTR_SIZE));
     assert_eq!(memory.unused(), 1024 - 16);
     memory.alloc(7);
     assert_eq!(memory.unused(), 1024 - 16 - 7);
-    assert!(memory.align());
+    assert!(memory.align(RUST_PTR_SIZE));
     assert_eq!(memory.unused(), 1024 - 16 - 8);
 }
 
@@ -169,27 +220,15 @@ enum WordFlag {
 pub struct DictEntryRef<'a> {
     data_space: &'a DataSpace,
     /// Points to start of the entry in DataSpace.
-    ptr: *mut u8,
+    ptr: ForthPtr,
 }
 
 impl<'a> DictEntryRef<'a> {
-    fn ptr_as_slice(&self) -> &[u8] {
-        let ptr = self.ptr as *const u8;
-        assert!(self.data_space.is_valid_ptr(ptr));
-        unsafe { std::slice::from_raw_parts(ptr, self.data_space.end() - ptr as usize) }
-    }
-
-    fn ptr_as_slice_mut(&mut self) -> &mut [u8] {
-        assert!(self.data_space.is_valid_ptr(self.ptr));
-        unsafe {
-            std::slice::from_raw_parts_mut(self.ptr, self.data_space.end() - self.ptr as usize)
-        }
-    }
+    const FLAGS_AND_NAME_LEN_OFFSET: usize = FORTH_CELL_SIZE as usize;
+    const NAME_OFFSET: usize = Self::FLAGS_AND_NAME_LEN_OFFSET + 1;
 
     pub fn prev(&self) -> Option<DictEntryRef<'a>> {
-        let buf_slice = self.ptr_as_slice();
-        let prev_bytes = <[u8; PTR_SIZE]>::try_from(&buf_slice[0..PTR_SIZE]).unwrap();
-        let prev_ptr = usize::from_ne_bytes(prev_bytes) as *mut u8;
+        let prev_ptr = ForthPtr(self.data_space.read_cell(self.ptr).unwrap() as ForthUCell);
         if prev_ptr.is_null() {
             None
         } else {
@@ -204,7 +243,14 @@ impl<'a> DictEntryRef<'a> {
     }
 
     fn flags_and_name_len(&self) -> u8 {
-        self.ptr_as_slice()[PTR_SIZE..][0]
+        self.data_space
+            .bytes_at(
+                self.ptr
+                    .checked_add(Self::FLAGS_AND_NAME_LEN_OFFSET as ForthUCell)
+                    .unwrap(),
+                1,
+            )
+            .unwrap()[0]
     }
 
     fn name_len(&self) -> u8 {
@@ -217,24 +263,39 @@ impl<'a> DictEntryRef<'a> {
 
     fn set_flags(&mut self, flags: u8) {
         assert_eq!(flags & DICT_ENTRY_LEN_MASK, 0);
-        self.ptr_as_slice_mut()[PTR_SIZE..][0] = self.name_len() | flags;
+        self.data_space
+            .write_byte(
+                self.ptr
+                    .checked_add(Self::FLAGS_AND_NAME_LEN_OFFSET as ForthUCell)
+                    .unwrap(),
+                self.name_len() | flags,
+            )
+            .unwrap();
     }
 
     pub fn name(&self) -> &str {
         let len = self.name_len() as usize;
-        // name_buf is after prev ptr and flags|len byte.
-        let name_buf = &self.ptr_as_slice()[PTR_SIZE + 1..][..len];
+        let name_buf = self
+            .data_space
+            .bytes_at(
+                self.ptr
+                    .checked_add(Self::NAME_OFFSET as ForthUCell)
+                    .unwrap(),
+                len,
+            )
+            .unwrap();
         std::str::from_utf8(name_buf).unwrap()
     }
 
-    pub fn definition_addr(&self) -> usize {
-        let addr = align_addr(self.name().as_ptr() as usize + self.name().len());
-        addr
+    pub fn definition_addr(&self) -> ForthPtr {
+        self.ptr
+            .byte_offset(Self::NAME_OFFSET as isize + self.name_len() as isize)
+            .align(FORTH_CELL_SIZE as ForthUCell)
     }
 
     // Size of the entry up to the definition_addr
     fn header_size(&self) -> usize {
-        self.definition_addr() - self.ptr as usize
+        self.definition_addr().byte_offset_from(self.ptr) as usize
     }
 
     // Return true if now hidden.
@@ -264,13 +325,13 @@ impl std::fmt::Debug for DictEntryRef<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "DictEntryRef {{ ptr: {:p}, end_of_data_space: {:p}, prev: {:p}, name: {}, flags: {:#x}, definition_addr: {:p} }}",
-            self.ptr as *const u8,
-            self.data_space.end() as *const u8,
-            self.prev().map_or(std::ptr::null(), |e| e.ptr),
+            "DictEntryRef {{ ptr: {:?}, end_of_data_space: {:?}, prev: {:?}, name: {}, flags: {:#x}, definition_addr: {:?} }}",
+            self.ptr,
+            self.data_space.end(),
+            self.prev().map_or(ForthPtr::null(), |e| e.ptr),
             self.name(),
             self.flags(),
-            self.definition_addr() as *const u8,
+            self.definition_addr(),
         )
     }
 }
@@ -281,15 +342,95 @@ impl std::fmt::Debug for DictEntryRef<'_> {
 #[derive(Debug)]
 pub struct DataSpace {
     memory: Memory,
-    dict_head: *mut u8,
+    dict_head: ForthPtr,
 }
 
 impl DataSpace {
     pub fn with_size(bytes: usize) -> Self {
+        assert!(
+            bytes <= (ForthUCell::MAX - FORTH_CELL_SIZE) as usize,
+            "trying to allocate bytes the ForthPtr cannot address"
+        );
+        let memory = Memory::with_size(bytes);
+        assert!(is_aligned(
+            memory.current as usize,
+            FORTH_CELL_SIZE as usize
+        ));
         DataSpace {
-            memory: Memory::with_size(bytes),
-            dict_head: std::ptr::null_mut(),
+            memory,
+            dict_head: ForthPtr::null(),
         }
+    }
+
+    fn memory_ptr_to_forth_ptr(&self, ptr: *mut u8) -> ForthPtr {
+        if ptr.is_null() {
+            ForthPtr::null()
+        } else {
+            let offset = unsafe { ptr.offset_from(self.memory.ptr) };
+            assert!(offset >= 0);
+            // Additionally offset by FORTH_CELL_SIZE, so that 0 can be used as null.
+            ForthPtr(
+                offset
+                    .checked_add(FORTH_CELL_SIZE as isize)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            )
+        }
+    }
+
+    fn forth_ptr_to_memory_ptr(&self, forth_ptr: ForthPtr) -> *mut u8 {
+        if forth_ptr.is_null() {
+            std::ptr::null_mut()
+        } else {
+            let offset = (forth_ptr.0 as isize)
+                .checked_sub(FORTH_CELL_SIZE as isize)
+                .unwrap();
+            assert!(offset >= 0);
+            unsafe { self.memory.ptr.offset(offset) }
+        }
+    }
+
+    pub fn bytes_at(&self, ptr: ForthPtr, len: usize) -> Result<&[u8], ForthError> {
+        assert!(len > 0);
+        if !self.is_valid_ptr(ptr) || !self.is_valid_ptr(ptr.byte_offset(len as isize - 1)) {
+            return Err(ForthError::InvalidPointer(ptr));
+        }
+        let ptr = self.forth_ptr_to_memory_ptr(ptr) as *const u8;
+        Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    pub fn bytes_mut_at(&self, ptr: ForthPtr, len: usize) -> Result<&mut [u8], ForthError> {
+        assert!(len > 0);
+        if !self.is_valid_ptr(ptr) || !self.is_valid_ptr(ptr.byte_offset(len as isize - 1)) {
+            return Err(ForthError::InvalidPointer(ptr));
+        }
+        let ptr = self.forth_ptr_to_memory_ptr(ptr);
+        Ok(unsafe { std::slice::from_raw_parts_mut(ptr, len) })
+    }
+
+    pub fn write_bytes(&self, ptr: ForthPtr, bytes: &[u8]) -> Result<(), ForthError> {
+        let buf = self.bytes_mut_at(ptr, bytes.len())?;
+        let mut cursor = std::io::Cursor::new(buf);
+        cursor.write_all(bytes).unwrap();
+        Ok(())
+    }
+
+    pub fn write_byte(&self, ptr: ForthPtr, val: u8) -> Result<(), ForthError> {
+        self.bytes_mut_at(ptr, 1)?[0] = val;
+        Ok(())
+    }
+
+    pub fn read_cell(&self, ptr: ForthPtr) -> Result<ForthCell, ForthError> {
+        let bytes = <[u8; FORTH_CELL_SIZE as usize]>::try_from(
+            self.bytes_at(ptr, FORTH_CELL_SIZE as usize)?,
+        )
+        .unwrap();
+        Ok(ForthCell::from_ne_bytes(bytes))
+    }
+
+    pub fn write_cell(&self, ptr: ForthPtr, val: ForthCell) -> Result<(), ForthError> {
+        self.write_bytes(ptr, &val.to_ne_bytes())
     }
 
     pub fn size(&self) -> usize {
@@ -297,39 +438,43 @@ impl DataSpace {
     }
 
     /// Past the end address of DataSpace
-    pub fn end(&self) -> usize {
-        self.memory.ptr as usize + self.size()
+    pub fn end(&self) -> ForthPtr {
+        self.memory_ptr_to_forth_ptr(self.memory.ptr)
+            .byte_offset(self.size() as isize)
     }
 
-    pub fn here(&self) -> usize {
-        self.memory.current as usize
+    pub fn here(&self) -> ForthPtr {
+        self.memory_ptr_to_forth_ptr(self.memory.current)
     }
 
     pub fn unused(&self) -> usize {
         self.memory.unused()
     }
 
-    pub fn is_valid_ptr<T>(&self, ptr: *const T) -> bool {
+    pub fn is_valid_ptr(&self, ptr: ForthPtr) -> bool {
+        let ptr = self.forth_ptr_to_memory_ptr(ptr);
         self.memory.is_valid_ptr(ptr)
     }
 
     #[must_use]
     pub fn align(&mut self) -> bool {
-        self.memory.align()
+        self.memory.align(FORTH_CELL_SIZE as usize)
     }
 
-    pub fn alloc(&mut self, bytes: usize) -> Option<*mut u8> {
-        self.memory.alloc(bytes)
+    pub fn alloc(&mut self, bytes: usize) -> Option<ForthPtr> {
+        self.memory
+            .alloc(bytes)
+            .map(|p| self.memory_ptr_to_forth_ptr(p))
     }
 
     #[must_use]
     pub fn dealloc(&mut self, bytes: usize) -> bool {
         assert!(bytes > 0);
-        let new_here = self.here() - bytes;
-        let mut new_dict_head = std::ptr::null_mut();
+        let new_here = self.here().byte_offset(-(bytes as isize));
+        let mut new_dict_head = ForthPtr::null();
         let mut maybe_entry = self.latest_entry();
         while let Some(entry) = maybe_entry {
-            if entry.ptr as usize + entry.header_size() <= new_here {
+            if entry.ptr.byte_offset(entry.header_size() as isize) <= new_here {
                 new_dict_head = entry.ptr;
                 break;
             } else {
@@ -351,14 +496,14 @@ impl DataSpace {
     pub fn push_dict_entry(&mut self, name: &str, flags: u8) -> bool {
         assert_eq!(flags & DICT_ENTRY_LEN_MASK, 0);
         assert!(name.len() <= DICT_ENTRY_LEN_MASK as usize);
-        let prev_addr = self.dict_head as usize;
-        let entry_size = PTR_SIZE + 1 + name.len();
+        let prev_addr = self.dict_head;
+        let entry_size = DictEntryRef::NAME_OFFSET + name.len();
         match self.alloc(entry_size) {
             None => false,
             Some(entry_ptr) => {
-                let buf = unsafe { std::slice::from_raw_parts_mut(entry_ptr, entry_size) };
+                let buf = self.bytes_mut_at(entry_ptr, entry_size).unwrap();
                 let mut cursor = std::io::Cursor::new(buf);
-                cursor.write_all(&prev_addr.to_ne_bytes()).unwrap();
+                cursor.write_all(&prev_addr.0.to_ne_bytes()).unwrap();
                 let flags_and_name_len = flags | (name.len() as u8);
                 cursor.write_all(&[flags_and_name_len]).unwrap();
                 cursor.write_all(name.as_bytes()).unwrap();
@@ -399,9 +544,9 @@ impl DataSpace {
 
     pub fn push_builtin_word(&mut self, name: &str, flags: u8, word_ix: usize) {
         assert!(self.push_dict_entry(name, flags));
-        let word_ix = word_ix + SPECIAL_CODEWORDS.len();
-        let ptr = self.alloc(PTR_SIZE).unwrap();
-        let buf = unsafe { std::slice::from_raw_parts_mut(ptr, PTR_SIZE) };
+        let word_ix: ForthUCell = (word_ix + SPECIAL_CODEWORDS.len()).try_into().unwrap();
+        let ptr = self.alloc(FORTH_CELL_SIZE as usize).unwrap();
+        let buf = self.bytes_mut_at(ptr, FORTH_CELL_SIZE as usize).unwrap();
         let mut cursor = std::io::Cursor::new(buf);
         cursor.write_all(&word_ix.to_ne_bytes()).unwrap();
     }
@@ -416,47 +561,44 @@ fn test_data_space_find_entry() {
         let dup = data_space.find_entry("DUP").unwrap();
         assert_eq!(dup.name(), "DUP");
         let latest = data_space.latest_entry().unwrap();
-        assert!(std::ptr::eq(dup.ptr, latest.ptr));
+        assert_eq!(dup.ptr, latest.ptr);
     }
     assert!(data_space.push_dict_entry("SWAP", 0));
     {
         let dup = data_space.find_entry("DUP").unwrap();
         assert_eq!(dup.name(), "DUP");
         let latest = data_space.latest_entry().unwrap();
-        assert!(!std::ptr::eq(dup.ptr, latest.ptr));
-        assert!(std::ptr::eq(dup.ptr, latest.prev().unwrap().ptr));
+        assert_ne!(dup.ptr, latest.ptr);
+        assert_eq!(dup.ptr, latest.prev().unwrap().ptr);
     }
     assert!(data_space.push_dict_entry("DUP", 0));
     {
         let dup = data_space.find_entry("DUP").unwrap();
         assert_eq!(dup.name(), "DUP");
         let latest = data_space.latest_entry().unwrap();
-        assert!(std::ptr::eq(dup.ptr, latest.ptr));
+        assert_eq!(dup.ptr, latest.ptr);
         let orig_dup = data_space
             .latest_entry()
             .and_then(|e| e.prev())
             .and_then(|e| e.prev())
             .unwrap();
         assert_eq!(dup.name(), orig_dup.name());
-        assert!(!std::ptr::eq(dup.ptr, orig_dup.ptr));
+        assert_ne!(dup.ptr, orig_dup.ptr);
         let dup_header_size = dup.header_size();
         let orig_dup_ptr = orig_dup.ptr;
         assert!(data_space.dealloc(dup_header_size));
-        assert!(std::ptr::eq(
-            data_space.find_entry("DUP").unwrap().ptr,
-            orig_dup_ptr
-        ))
+        assert_eq!(data_space.find_entry("DUP").unwrap().ptr, orig_dup_ptr)
     }
 }
 
-const FORTH_TRUE: isize = -1;
-const FORTH_FALSE: isize = 0;
+const FORTH_TRUE: ForthCell = -1;
+const FORTH_FALSE: ForthCell = 0;
 const INPUT_BUFFER_SIZE: usize = 256;
 
 #[derive(Debug)]
 struct StackImpl {
-    start: *mut isize,
-    end: *mut isize,
+    start: ForthPtr,
+    end: ForthPtr,
     max_elements: usize,
 }
 
@@ -464,7 +606,9 @@ impl StackImpl {
     fn alloc(data_space: &mut DataSpace, max_elements: usize) -> StackImpl {
         assert!(max_elements > 0);
         assert!(data_space.align());
-        let start = data_space.alloc(max_elements * PTR_SIZE).unwrap() as *mut isize;
+        let start = data_space
+            .alloc(max_elements * FORTH_CELL_SIZE as usize)
+            .unwrap();
         Self {
             start,
             end: start,
@@ -481,7 +625,9 @@ pub struct Stack<'a> {
 impl<'a> Stack<'a> {
     pub fn len(&self) -> usize {
         assert!(self.data_space.is_valid_ptr(self.stack.start));
-        let offset = unsafe { self.stack.end.offset_from(self.stack.start) };
+        let byte_offset = self.stack.end.byte_offset_from(self.stack.start);
+        assert_eq!(byte_offset % FORTH_CELL_SIZE as isize, 0);
+        let offset = byte_offset / FORTH_CELL_SIZE as isize;
         assert!(offset >= 0);
         offset as usize
     }
@@ -492,44 +638,33 @@ impl<'a> Stack<'a> {
         self.stack.end = self.stack.start
     }
     #[must_use]
-    pub fn push(&mut self, val: isize) -> Option<()> {
+    pub fn push(&mut self, val: ForthCell) -> Option<()> {
         if self.len() < self.stack.max_elements {
-            assert!(self.data_space.is_valid_ptr(self.stack.end));
-            unsafe { *self.stack.end = val };
-            self.stack.end = unsafe { self.stack.end.offset(1) };
+            self.data_space.write_cell(self.stack.end, val).unwrap();
+            self.stack.end = self.stack.end.checked_add(FORTH_CELL_SIZE).unwrap();
             Some(())
         } else {
             None
         }
     }
     #[must_use]
-    pub fn pop(&mut self) -> Option<isize> {
+    pub fn pop(&mut self) -> Option<ForthCell> {
         if self.is_empty() {
             None
         } else {
-            let last_ptr = unsafe { self.stack.end.offset(-1) };
-            assert!(self.data_space.is_valid_ptr(last_ptr));
-            let val = unsafe { *last_ptr };
+            let last_ptr = self.stack.end.checked_sub(FORTH_CELL_SIZE).unwrap();
+            let val = self.data_space.read_cell(last_ptr).unwrap();
             self.stack.end = last_ptr;
             Some(val)
         }
     }
-    pub fn last(&mut self) -> Option<&isize> {
+    pub fn last(&mut self) -> Option<ForthCell> {
         if self.is_empty() {
             None
         } else {
-            let last_ptr = unsafe { self.stack.end.offset(-1) };
-            assert!(self.data_space.is_valid_ptr(last_ptr));
-            unsafe { last_ptr.as_ref() }
-        }
-    }
-    pub fn last_mut(&mut self) -> Option<&mut isize> {
-        if self.is_empty() {
-            None
-        } else {
-            let last_ptr = unsafe { self.stack.end.offset(-1) };
-            assert!(self.data_space.is_valid_ptr(last_ptr));
-            unsafe { last_ptr.as_mut() }
+            let last_ptr = self.stack.end.checked_sub(FORTH_CELL_SIZE).unwrap();
+            let val = self.data_space.read_cell(last_ptr).unwrap();
+            Some(val)
         }
     }
     pub fn iter(&self) -> StackIterator {
@@ -539,7 +674,7 @@ impl<'a> Stack<'a> {
 
 pub struct StackIterator<'a> {
     stack: &'a Stack<'a>,
-    current: *const isize,
+    current: ForthPtr,
 }
 impl<'a> StackIterator<'a> {
     fn new(stack: &'a Stack<'a>) -> Self {
@@ -550,20 +685,19 @@ impl<'a> StackIterator<'a> {
     }
 }
 impl Iterator for StackIterator<'_> {
-    type Item = isize;
+    type Item = ForthCell;
     fn next(&mut self) -> Option<Self::Item> {
         if self.current == self.stack.stack.end {
             None
         } else {
-            assert!(self.stack.data_space.is_valid_ptr(self.current));
-            let val = unsafe { *self.current };
-            self.current = unsafe { self.current.offset(1) };
+            let val = self.stack.data_space.read_cell(self.current).unwrap();
+            self.current = self.current.checked_add(FORTH_CELL_SIZE).unwrap();
             Some(val)
         }
     }
 }
 impl<'a> IntoIterator for &'a Stack<'a> {
-    type Item = isize;
+    type Item = ForthCell;
     type IntoIter = StackIterator<'a>;
     fn into_iter(self) -> Self::IntoIter {
         StackIterator::new(self)
@@ -575,8 +709,8 @@ impl std::fmt::Debug for Stack<'_> {
         let mut elements = Vec::with_capacity(self.len());
         let mut ptr = self.stack.start;
         while self.data_space.is_valid_ptr(ptr) && ptr < self.stack.end {
-            elements.push(unsafe { *ptr });
-            unsafe { ptr = ptr.offset(1) };
+            elements.push(self.data_space.read_cell(ptr).unwrap());
+            ptr = ptr.checked_add(FORTH_CELL_SIZE).unwrap();
         }
         write!(f, "Stack {{ {:?}, elements: {:?} }}", self.stack, elements,)
     }
@@ -597,8 +731,8 @@ pub enum ForthError {
     InputBufferLimitReached,
     AllocFailed,
     DeallocFailed,
-    InvalidPointer(usize),
-    AddressOverflow(usize),
+    InvalidPointer(ForthPtr),
+    AddressOverflow(ForthPtr),
     NoLatestEntry,
     CreateMissingWord,
     InvalidStringEncoding,
@@ -611,12 +745,12 @@ pub struct ForthMachine {
     data_space: DataSpace,
     data_stack: StackImpl,
     return_stack: StackImpl,
-    curr_def_addr: usize,
-    instruction_addr: usize,
-    curr_input_ix_ptr: *mut usize,
-    curr_input_len: usize,
+    curr_def_addr: ForthPtr,
+    instruction_addr: ForthPtr,
+    curr_input_ix_ptr: ForthPtr,
+    curr_input_len: ForthUCell,
     // Stdin line parse area inside `data_space`; length is INPUT_BUFFER_SIZE.
-    input_buffer_ptr: *mut u8,
+    input_buffer_ptr: ForthPtr,
     state: ForthState,
     // Backtrace of words when error happens. (this is only from
     // exec_fun_indirect, we need to traverse the return stack and try
@@ -630,7 +764,8 @@ impl ForthMachine {
         data_stack_size: usize,
         return_stack_size: usize,
     ) -> Self {
-        let curr_input_ix_ptr = push_variable(&mut data_space, ">IN", 0) as *mut usize;
+        let curr_input_ix_ptr = push_variable(&mut data_space, ">IN", 0);
+        assert!(ForthUCell::MAX as usize >= INPUT_BUFFER_SIZE);
         let input_buffer_ptr = data_space.alloc(INPUT_BUFFER_SIZE).unwrap();
         assert!(data_space.align());
         let data_stack = StackImpl::alloc(&mut data_space, data_stack_size);
@@ -643,8 +778,8 @@ impl ForthMachine {
             data_space,
             data_stack,
             return_stack,
-            instruction_addr: 0,
-            curr_def_addr: 0,
+            instruction_addr: ForthPtr::null(),
+            curr_def_addr: ForthPtr::null(),
             curr_input_ix_ptr,
             curr_input_len: 0,
             input_buffer_ptr,
@@ -653,16 +788,19 @@ impl ForthMachine {
         }
     }
 
-    fn curr_input_ix(&self) -> usize {
-        assert!(self.data_space.is_valid_ptr(self.curr_input_ix_ptr));
-        unsafe { *self.curr_input_ix_ptr }
+    fn curr_input_ix(&self) -> Result<ForthUCell, ForthError> {
+        self.data_space
+            .read_cell(self.curr_input_ix_ptr)
+            .map(|v| v as ForthUCell)
     }
-    fn set_curr_input_ix(&mut self, ix: usize) {
-        assert!(self.data_space.is_valid_ptr(self.curr_input_ix_ptr));
-        unsafe { *self.curr_input_ix_ptr = ix };
+    fn set_curr_input_ix(&mut self, ix: ForthUCell) -> Result<(), ForthError> {
+        self.data_space
+            .write_cell(self.curr_input_ix_ptr, ix as ForthCell)
     }
     fn input_buffer(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.input_buffer_ptr, INPUT_BUFFER_SIZE) }
+        self.data_space
+            .bytes_mut_at(self.input_buffer_ptr, INPUT_BUFFER_SIZE)
+            .unwrap()
     }
 
     pub fn data_stack(&mut self) -> Stack {
@@ -683,53 +821,48 @@ impl ForthMachine {
         bye_builtin(self).unwrap();
     }
 
-    pub fn push_variable(&mut self, name: &str, val: isize) -> *mut isize {
+    pub fn push_variable(&mut self, name: &str, val: ForthCell) -> ForthPtr {
         push_variable(&mut self.data_space, name, val)
     }
-    pub fn push_buffer(&mut self, name: &str, bytes: usize) -> *mut u8 {
+    pub fn push_buffer(&mut self, name: &str, bytes: usize) -> ForthPtr {
         push_buffer(&mut self.data_space, name, bytes)
     }
 }
 
-fn ds_pop(forth: &mut ForthMachine) -> Result<isize, ForthError> {
+fn ds_pop(forth: &mut ForthMachine) -> Result<ForthCell, ForthError> {
     forth.data_stack().pop().ok_or(ForthError::DataStackEmpty)
 }
-fn ds_push(forth: &mut ForthMachine, val: isize) -> Result<(), ForthError> {
+fn ds_push(forth: &mut ForthMachine, val: ForthCell) -> Result<(), ForthError> {
     forth
         .data_stack()
         .push(val)
         .ok_or(ForthError::DataStackLimitReached)
 }
-fn ds_last(forth: &mut ForthMachine) -> Result<isize, ForthError> {
-    forth
-        .data_stack()
-        .last()
-        .copied()
-        .ok_or(ForthError::DataStackEmpty)
+fn ds_last(forth: &mut ForthMachine) -> Result<ForthCell, ForthError> {
+    forth.data_stack().last().ok_or(ForthError::DataStackEmpty)
 }
 
-fn rs_pop(forth: &mut ForthMachine) -> Result<isize, ForthError> {
+fn rs_pop(forth: &mut ForthMachine) -> Result<ForthCell, ForthError> {
     forth
         .return_stack()
         .pop()
         .ok_or(ForthError::ReturnStackEmpty)
 }
-fn rs_push(forth: &mut ForthMachine, val: isize) -> Result<(), ForthError> {
+fn rs_push(forth: &mut ForthMachine, val: ForthCell) -> Result<(), ForthError> {
     forth
         .return_stack()
         .push(val)
         .ok_or(ForthError::ReturnStackLimitReached)
 }
-fn rs_last(forth: &mut ForthMachine) -> Result<isize, ForthError> {
+fn rs_last(forth: &mut ForthMachine) -> Result<ForthCell, ForthError> {
     forth
         .return_stack()
         .last()
-        .copied()
         .ok_or(ForthError::ReturnStackEmpty)
 }
 
 fn bye_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
-    forth.instruction_addr = 0;
+    forth.instruction_addr = ForthPtr::null();
     Ok(())
 }
 
@@ -740,9 +873,8 @@ fn drop_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
 
 fn nip_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
     let val = ds_pop(forth)?;
-    let mut ds = forth.data_stack();
-    *ds.last_mut().ok_or(ForthError::DataStackEmpty)? = val;
-    Ok(())
+    ds_pop(forth)?;
+    ds_push(forth, val)
 }
 
 fn dup_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
@@ -770,17 +902,17 @@ fn rot_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
 // used when creating new words (via DOCOL_IX).
 // TODO: Maybe make a DOCOL word (constant) that pushes DOCOL_IX on stack.
 fn docol(forth: &mut ForthMachine) -> Result<(), ForthError> {
-    let ret_addr = forth.instruction_addr as isize;
+    let ret_addr = forth.instruction_addr.0 as ForthCell;
     rs_push(forth, ret_addr)?;
     forth.instruction_addr = forth
         .curr_def_addr
-        .checked_add(PTR_SIZE)
+        .checked_add(FORTH_CELL_SIZE)
         .ok_or(ForthError::AddressOverflow(forth.curr_def_addr))?;
     Ok(())
 }
 
 fn exit_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
-    forth.instruction_addr = rs_pop(forth)? as usize;
+    forth.instruction_addr = ForthPtr(rs_pop(forth)? as ForthUCell);
     Ok(())
 }
 
@@ -796,8 +928,10 @@ fn refill_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
                 forth.input_buffer().write(line.as_bytes()).unwrap(),
                 num_read
             );
-            forth.curr_input_len = num_read;
-            forth.set_curr_input_ix(0);
+            forth.curr_input_len = num_read
+                .try_into()
+                .expect("num_read should fit into ForthUCell because INPUT_BUFFER_SIZE fits.");
+            forth.set_curr_input_ix(0)?;
             return ds_push(forth, FORTH_TRUE);
         }
     }
@@ -806,20 +940,20 @@ fn refill_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
 
 fn source_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
     let ptr = forth.input_buffer_ptr;
-    ds_push(forth, ptr as isize)?;
+    ds_push(forth, ptr.0 as ForthCell)?;
     let len = forth.curr_input_len;
-    ds_push(forth, len as isize)
+    ds_push(forth, len as ForthCell)
 }
 
 fn read_input_byte(forth: &mut ForthMachine) -> Option<u8> {
-    if forth.curr_input_ix() >= forth.curr_input_len {
+    let curr_ix = forth.curr_input_ix().unwrap();
+    if curr_ix >= forth.curr_input_len {
         None
     } else {
-        let curr_ix = forth.curr_input_ix();
         assert!(curr_ix < forth.curr_input_len);
-        assert!(forth.curr_input_len <= INPUT_BUFFER_SIZE);
-        let byte = forth.input_buffer()[curr_ix];
-        forth.set_curr_input_ix(curr_ix + 1);
+        assert!(forth.curr_input_len as usize <= INPUT_BUFFER_SIZE);
+        let byte = forth.input_buffer()[curr_ix as usize];
+        forth.set_curr_input_ix(curr_ix + 1).unwrap();
         Some(byte)
     }
 }
@@ -833,8 +967,7 @@ fn emit_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
 // ( "ccc<eol>" -- )
 // Parses and discards \ comments
 fn backslash_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
-    forth.set_curr_input_ix(forth.curr_input_len);
-    Ok(())
+    forth.set_curr_input_ix(forth.curr_input_len)
 }
 
 const BLANK_CHARS: [char; 3] = [' ', '\t', '\n'];
@@ -846,23 +979,27 @@ const BLANK_CHARS: [char; 3] = [' ', '\t', '\n'];
 fn word_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
     let (ptr, len) = match do_word_builtin(forth) {
         None => (
-            unsafe { forth.input_buffer_ptr.add(INPUT_BUFFER_SIZE) as *const u8 },
+            forth
+                .input_buffer_ptr
+                .checked_add(INPUT_BUFFER_SIZE as ForthUCell)
+                .unwrap(),
             0,
         ),
         Some((ptr, len)) => (ptr, len),
     };
-    ds_push(forth, ptr as isize)?;
-    ds_push(forth, len as isize)
+    ds_push(forth, ptr.0 as ForthCell)?;
+    ds_push(forth, len as ForthCell)
 }
-fn do_word_builtin(forth: &mut ForthMachine) -> Option<(*const u8, usize)> {
+fn do_word_builtin(forth: &mut ForthMachine) -> Option<(ForthPtr, ForthUCell)> {
     let mut byte = read_input_byte(forth)?;
     // Skip blanks
     while BLANK_CHARS.contains(&byte.into()) {
         byte = read_input_byte(forth)?;
     }
-    assert!(forth.curr_input_ix() > 0);
-    assert!(forth.curr_input_ix() <= INPUT_BUFFER_SIZE);
-    let start_ptr = unsafe { forth.input_buffer_ptr.add(forth.curr_input_ix() - 1) };
+    let curr_ix = forth.curr_input_ix().unwrap();
+    assert!(curr_ix > 0);
+    assert!(curr_ix as usize <= INPUT_BUFFER_SIZE);
+    let start_ptr = forth.input_buffer_ptr.checked_add(curr_ix - 1).unwrap();
     let mut len = 0;
     while !BLANK_CHARS.contains(&byte.into()) {
         len += 1;
@@ -871,57 +1008,44 @@ fn do_word_builtin(forth: &mut ForthMachine) -> Option<(*const u8, usize)> {
             Some(b) => byte = b,
         }
     }
-    assert!(forth.curr_input_ix() <= INPUT_BUFFER_SIZE);
+    assert!(forth.curr_input_ix().unwrap() as usize <= INPUT_BUFFER_SIZE);
     assert!(len > 0);
-    Some((start_ptr, len as usize))
-}
-
-fn check_ptr<T>(forth: &ForthMachine, ptr: *const T) -> Result<(), ForthError> {
-    if !forth.data_space.is_valid_ptr(ptr) {
-        return Err(ForthError::InvalidPointer(ptr as usize));
-    }
-    Ok(())
+    Some((start_ptr, len.try_into().unwrap()))
 }
 
 fn store_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
-    let ptr = ds_pop(forth)? as *mut isize;
-    check_ptr(forth, ptr)?;
+    let ptr = ForthPtr(ds_pop(forth)? as ForthUCell);
     let val = ds_pop(forth)?;
-    unsafe { *ptr = val };
-    Ok(())
+    forth.data_space.write_cell(ptr, val)
 }
 fn store_byte_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
-    let ptr = ds_pop(forth)? as *mut u8;
-    check_ptr(forth, ptr)?;
+    let ptr = ForthPtr(ds_pop(forth)? as ForthUCell);
     let val = ds_pop(forth)? as u8;
-    unsafe { *ptr = val };
-    Ok(())
+    forth.data_space.write_byte(ptr, val)
 }
 
 fn fetch_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
-    let ptr = ds_pop(forth)? as *const isize;
-    check_ptr(forth, ptr)?;
-    let val = unsafe { *ptr };
+    let ptr = ForthPtr(ds_pop(forth)? as ForthUCell);
+    let val = forth.data_space.read_cell(ptr)?;
     ds_push(forth, val)
 }
 fn fetch_byte_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
-    let ptr = ds_pop(forth)? as *const u8;
-    check_ptr(forth, ptr)?;
-    let val = unsafe { *ptr };
-    ds_push(forth, val as isize)
+    let ptr = ForthPtr(ds_pop(forth)? as ForthUCell);
+    let val = forth.data_space.bytes_at(ptr, 1)?[0];
+    ds_push(forth, val as ForthCell)
 }
 
-fn parse_num(src: &str, radix: u32) -> Result<isize, std::num::ParseIntError> {
+fn parse_num(src: &str, radix: u32) -> Result<ForthCell, std::num::ParseIntError> {
     if let Some(src) = src.strip_prefix('#') {
-        isize::from_str_radix(src, 10)
+        ForthCell::from_str_radix(src, 10)
     } else if let Some(src) = src.strip_prefix('$') {
-        isize::from_str_radix(src, 16)
+        ForthCell::from_str_radix(src, 16)
     } else if let Some(src) = src.strip_prefix('%') {
-        isize::from_str_radix(src, 2)
+        ForthCell::from_str_radix(src, 2)
     } else if src.starts_with('\'') && src.ends_with('\'') && src.chars().count() == 3 {
-        Ok(src.chars().nth(1).unwrap() as isize)
+        Ok(src.chars().nth(1).unwrap() as ForthCell)
     } else {
-        isize::from_str_radix(src, radix)
+        ForthCell::from_str_radix(src, radix)
     }
 }
 
@@ -929,18 +1053,16 @@ fn parse_num(src: &str, radix: u32) -> Result<isize, std::num::ParseIntError> {
 // (addr u - n f)
 // NOTE: Based on Gforth's S>NUMBER?, but we return a single cell number.
 fn s_to_number_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
-    let byte_len = ds_pop(forth)? as usize;
-    let ptr = ds_pop(forth)? as *const u8;
+    let byte_len = ds_pop(forth)? as ForthUCell;
+    let ptr = ForthPtr(ds_pop(forth)? as ForthUCell);
     if byte_len == 0 {
         ds_push(forth, 0)?;
         return ds_push(forth, FORTH_FALSE);
     }
-    check_ptr(forth, ptr)?;
-    check_ptr(forth, (ptr as usize + byte_len - 1) as *const u8)?;
-    let bytes = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
+    let bytes = forth.data_space.bytes_at(ptr, byte_len as usize)?;
+    let name = std::str::from_utf8(bytes).map_err(|_| ForthError::InvalidStringEncoding)?;
     // TODO: Use BASE variable for parsing.
     let base = 10;
-    let name = std::str::from_utf8(bytes).map_err(|_| ForthError::InvalidStringEncoding)?;
     match parse_num(name, base) {
         Ok(num) => {
             ds_push(forth, num)?;
@@ -956,23 +1078,21 @@ fn s_to_number_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
 // Return name token (start of dict entry) or 0.
 // (addr u - nt | 0)
 fn find_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
-    let byte_len = ds_pop(forth)? as usize;
-    let ptr = ds_pop(forth)? as *const u8;
-    check_ptr(forth, ptr)?;
-    check_ptr(forth, (ptr as usize + byte_len - 1) as *const u8)?;
-    let bytes = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
+    let byte_len = ds_pop(forth)? as ForthUCell as usize;
+    let ptr = ForthPtr(ds_pop(forth)? as ForthUCell);
+    let bytes = forth.data_space.bytes_at(ptr, byte_len)?;
     let name = std::str::from_utf8(bytes).map_err(|_| ForthError::InvalidStringEncoding)?;
     match forth.data_space.find_entry(name) {
         None => ds_push(forth, 0),
         Some(dict_entry_ref) => {
-            let dict_entry_addr = dict_entry_ref.ptr as *const u8 as isize;
+            let dict_entry_addr = dict_entry_ref.ptr.0 as ForthCell;
             ds_push(forth, dict_entry_addr)
         }
     }
 }
 
 fn latest_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
-    let dict_head_addr = forth.data_space.dict_head as isize;
+    let dict_head_addr = forth.data_space.dict_head.0 as ForthCell;
     ds_push(forth, dict_head_addr)
 }
 
@@ -990,17 +1110,17 @@ fn words_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
 
 // Return Code Field Address (i.e. definition address of a dict entry).
 fn to_cfa_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
-    let ptr = ds_pop(forth)? as *mut u8;
+    let ptr = ForthPtr(ds_pop(forth)? as ForthUCell);
     let dict_entry_ref = DictEntryRef {
         data_space: &forth.data_space,
         ptr,
     };
-    let def_addr = dict_entry_ref.definition_addr() as isize;
+    let def_addr = dict_entry_ref.definition_addr().0 as ForthCell;
     ds_push(forth, def_addr)
 }
 
 fn hidden_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
-    let ptr = ds_pop(forth)? as *mut u8;
+    let ptr = ForthPtr(ds_pop(forth)? as ForthUCell);
     let mut dict_entry_ref = DictEntryRef {
         data_space: &forth.data_space,
         ptr,
@@ -1019,13 +1139,12 @@ fn immediate_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
 }
 
 fn branch_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
-    let ptr_to_offset = forth.instruction_addr as *const isize;
-    check_ptr(forth, ptr_to_offset)?;
-    let offset = unsafe { *ptr_to_offset };
+    let ptr_to_offset = forth.instruction_addr;
+    let offset = forth.data_space.read_cell(ptr_to_offset)?;
     if offset >= 0 {
         forth.instruction_addr = forth
             .instruction_addr
-            .checked_add(offset as usize)
+            .checked_add(offset as ForthUCell)
             .ok_or(ForthError::AddressOverflow(forth.instruction_addr))?;
         Ok(())
     } else {
@@ -1044,20 +1163,19 @@ fn zbranch_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
     } else {
         forth.instruction_addr = forth
             .instruction_addr
-            .checked_add(PTR_SIZE)
+            .checked_add(FORTH_CELL_SIZE)
             .ok_or(ForthError::AddressOverflow(forth.instruction_addr))?;
         Ok(())
     }
 }
 
 fn lit_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
-    let ptr_to_val = forth.instruction_addr as *const isize;
-    check_ptr(forth, ptr_to_val)?;
-    let val = unsafe { *ptr_to_val };
+    let ptr_to_val = forth.instruction_addr;
+    let val = forth.data_space.read_cell(ptr_to_val)?;
     // println!("val: {:#x}", val);
     forth.instruction_addr = forth
         .instruction_addr
-        .checked_add(PTR_SIZE)
+        .checked_add(FORTH_CELL_SIZE)
         .ok_or(ForthError::AddressOverflow(forth.instruction_addr))?;
     ds_push(forth, val)
 }
@@ -1069,7 +1187,7 @@ fn allot_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
             .data_space
             .alloc(bytes as usize)
             .ok_or(ForthError::AllocFailed)?;
-    } else if bytes < 0 && !forth.data_space.dealloc(bytes.unsigned_abs()) {
+    } else if bytes < 0 && !forth.data_space.dealloc(bytes.unsigned_abs() as usize) {
         return Err(ForthError::DeallocFailed);
     }
     Ok(())
@@ -1083,14 +1201,13 @@ fn allot_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
 // NOTE: `DOES>` & `>BODY` are implemented in rforth.fs
 fn create_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
     let (ptr, byte_len) = do_word_builtin(forth).ok_or(ForthError::CreateMissingWord)?;
-    check_ptr(forth, ptr)?;
-    check_ptr(forth, (ptr as usize + byte_len - 1) as *const u8)?;
-    let bytes = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
-    let name = std::str::from_utf8(bytes).map_err(|_| ForthError::InvalidStringEncoding)?;
+    // TODO: Figure out a way to avoid `to_vec`.
+    let bytes = forth.data_space.bytes_at(ptr, byte_len as usize)?.to_vec();
+    let name = std::str::from_utf8(&bytes).map_err(|_| ForthError::InvalidStringEncoding)?;
     // println!("Pushing '{}' to dict", name);
     // TODO: These should have AllocFailed errors
     assert!(forth.data_space.push_dict_entry(name, 0));
-    push_instruction(&mut forth.data_space, DOCREATE_IX);
+    push_instruction(&mut forth.data_space, DOCREATE_IX as ForthUCell);
     push_instruction(&mut forth.data_space, 0);
     Ok(())
 }
@@ -1100,24 +1217,22 @@ fn create_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
 // is not 0, it will then set the next instruction to be found at that `ptr`.
 // This way we implement run-time semantics of a CREATEd word that has DOES>.
 fn docreate(forth: &mut ForthMachine) -> Result<(), ForthError> {
-    check_ptr(forth, forth.curr_def_addr as *const usize)?;
-    let fun_addr = unsafe { *(forth.curr_def_addr as *const usize) };
     // Sanity check that forth.curr_def_addr is indeed the dict entry we are
     // executing in.
+    let fun_addr = forth.data_space.read_cell(forth.curr_def_addr)? as ForthUCell as usize;
     assert_eq!(fun_addr, DOCREATE_IX);
+
     let instr_addr_ptr = forth
         .curr_def_addr
-        .checked_add(PTR_SIZE)
-        .ok_or(ForthError::AddressOverflow(forth.curr_def_addr))?
-        as *const usize;
-    check_ptr(forth, instr_addr_ptr)?;
-    let data_addr = (instr_addr_ptr as usize)
-        .checked_add(PTR_SIZE)
-        .ok_or(ForthError::AddressOverflow(instr_addr_ptr as usize))?;
-    ds_push(forth, data_addr as isize)?;
-    let instr_addr = unsafe { *instr_addr_ptr };
-    if instr_addr != 0 {
-        let ret_addr = forth.instruction_addr as isize;
+        .checked_add(FORTH_CELL_SIZE)
+        .ok_or(ForthError::AddressOverflow(forth.curr_def_addr))?;
+    let instr_addr = ForthPtr(forth.data_space.read_cell(instr_addr_ptr)? as ForthUCell);
+    let data_addr = instr_addr_ptr
+        .checked_add(FORTH_CELL_SIZE)
+        .ok_or(ForthError::AddressOverflow(instr_addr_ptr))?;
+    ds_push(forth, data_addr.0 as ForthCell)?;
+    if !instr_addr.is_null() {
+        let ret_addr = forth.instruction_addr.0 as ForthCell;
         rs_push(forth, ret_addr)?;
         forth.instruction_addr = instr_addr;
     }
@@ -1126,7 +1241,7 @@ fn docreate(forth: &mut ForthMachine) -> Result<(), ForthError> {
 
 fn comma_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
     let def_addr = ds_pop(forth)?;
-    push_instruction(&mut forth.data_space, def_addr as usize);
+    push_instruction(&mut forth.data_space, def_addr as ForthUCell);
     Ok(())
 }
 
@@ -1146,9 +1261,7 @@ fn interpret_single_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> 
         None => return Ok(()),
         Some((ptr, byte_len)) => (ptr, byte_len),
     };
-    check_ptr(forth, ptr)?;
-    check_ptr(forth, (ptr as usize + byte_len - 1) as *const u8)?;
-    let bytes = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
+    let bytes = forth.data_space.bytes_at(ptr, byte_len as usize)?;
     let name = std::str::from_utf8(bytes).map_err(|_| ForthError::InvalidStringEncoding)?;
     if let Some(dict_entry_ref) = forth.data_space.find_entry(name) {
         // dbg!(dict_entry_ref);
@@ -1157,7 +1270,7 @@ fn interpret_single_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> 
         } else {
             // Compiling
             let def_addr = dict_entry_ref.definition_addr();
-            push_instruction(&mut forth.data_space, def_addr);
+            push_instruction(&mut forth.data_space, def_addr.0);
             Ok(())
         }
     } else {
@@ -1172,8 +1285,8 @@ fn interpret_single_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> 
                     .find_entry("LIT")
                     .unwrap()
                     .definition_addr();
-                push_instruction(&mut forth.data_space, lit);
-                push_instruction(&mut forth.data_space, num as usize);
+                push_instruction(&mut forth.data_space, lit.0);
+                push_instruction(&mut forth.data_space, num as ForthUCell);
                 Ok(())
             }
         }
@@ -1186,13 +1299,13 @@ fn rs_clear_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
 }
 
 fn execute_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
-    let def_addr = ds_pop(forth)? as usize;
+    let def_addr = ForthPtr(ds_pop(forth)? as ForthUCell);
     exec_fun_indirect(def_addr, forth)
 }
 
 fn here_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
-    let here_addr = forth.data_space.here() as isize;
-    ds_push(forth, here_addr)
+    let here_addr = forth.data_space.here();
+    ds_push(forth, here_addr.0 as ForthCell)
 }
 
 fn align_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
@@ -1203,37 +1316,31 @@ fn align_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
 }
 
 fn unused_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
-    let unused = forth.data_space.unused() as isize;
+    let unused = forth.data_space.unused() as ForthCell;
     ds_push(forth, unused)
 }
 
 fn cells_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
     let n = ds_pop(forth)?;
-    ds_push(forth, n.wrapping_mul(PTR_SIZE as isize))
+    ds_push(forth, n.wrapping_mul(FORTH_CELL_SIZE as ForthCell))
 }
 
 fn add_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
     let b = ds_pop(forth)?;
-    let mut ds = forth.data_stack();
-    let a = ds.last_mut().ok_or(ForthError::DataStackEmpty)?;
-    *a = a.wrapping_add(b);
-    Ok(())
+    let a = ds_pop(forth)?;
+    ds_push(forth, a.wrapping_add(b))
 }
 
 fn sub_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
     let b = ds_pop(forth)?;
-    let mut ds = forth.data_stack();
-    let a = ds.last_mut().ok_or(ForthError::DataStackEmpty)?;
-    *a = a.wrapping_sub(b);
-    Ok(())
+    let a = ds_pop(forth)?;
+    ds_push(forth, a.wrapping_sub(b))
 }
 
 fn mul_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
     let b = ds_pop(forth)?;
-    let mut ds = forth.data_stack();
-    let a = ds.last_mut().ok_or(ForthError::DataStackEmpty)?;
-    *a = a.wrapping_mul(b);
-    Ok(())
+    let a = ds_pop(forth)?;
+    ds_push(forth, a.wrapping_mul(b))
 }
 
 fn slash_mod_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
@@ -1248,7 +1355,7 @@ fn slash_mod_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
 
 fn abs_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
     let a = ds_pop(forth)?;
-    ds_push(forth, a.unsigned_abs() as isize)
+    ds_push(forth, a.unsigned_abs() as ForthCell)
 }
 
 fn invert_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
@@ -1257,33 +1364,33 @@ fn invert_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
 }
 
 fn and_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
-    let b = ds_pop(forth)? as usize;
-    let a = ds_pop(forth)? as usize;
-    ds_push(forth, (a & b) as isize)
+    let b = ds_pop(forth)? as ForthUCell;
+    let a = ds_pop(forth)? as ForthUCell;
+    ds_push(forth, (a & b) as ForthCell)
 }
 
 fn or_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
-    let b = ds_pop(forth)? as usize;
-    let a = ds_pop(forth)? as usize;
-    ds_push(forth, (a | b) as isize)
+    let b = ds_pop(forth)? as ForthUCell;
+    let a = ds_pop(forth)? as ForthUCell;
+    ds_push(forth, (a | b) as ForthCell)
 }
 
 fn xor_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
-    let b = ds_pop(forth)? as usize;
-    let a = ds_pop(forth)? as usize;
-    ds_push(forth, (a ^ b) as isize)
+    let b = ds_pop(forth)? as ForthUCell;
+    let a = ds_pop(forth)? as ForthUCell;
+    ds_push(forth, (a ^ b) as ForthCell)
 }
 
 fn lshift_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
-    let b = ds_pop(forth)? as usize;
-    let a = ds_pop(forth)? as usize;
-    ds_push(forth, (a << b) as isize)
+    let b = ds_pop(forth)? as ForthUCell;
+    let a = ds_pop(forth)? as ForthUCell;
+    ds_push(forth, (a << b) as ForthCell)
 }
 
 fn rshift_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
-    let b = ds_pop(forth)? as usize;
-    let a = ds_pop(forth)? as usize;
-    ds_push(forth, (a >> b) as isize)
+    let b = ds_pop(forth)? as ForthUCell;
+    let a = ds_pop(forth)? as ForthUCell;
+    ds_push(forth, (a >> b) as ForthCell)
 }
 
 fn eq_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
@@ -1299,8 +1406,8 @@ fn greater_than_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
 }
 
 fn u_greater_than_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
-    let b = ds_pop(forth)? as usize;
-    let a = ds_pop(forth)? as usize;
+    let b = ds_pop(forth)? as ForthUCell;
+    let a = ds_pop(forth)? as ForthUCell;
     ds_push(forth, if a > b { FORTH_TRUE } else { FORTH_FALSE })
 }
 
@@ -1404,11 +1511,10 @@ const BUILTIN_WORDS: [(&str, u8, fn(&mut ForthMachine) -> Result<(), ForthError>
     ("]", 0, rbrac_builtin),
 ];
 
-fn exec_fun_indirect(addr: usize, forth: &mut ForthMachine) -> Result<(), ForthError> {
-    forth.curr_def_addr = addr;
+fn exec_fun_indirect(def_addr: ForthPtr, forth: &mut ForthMachine) -> Result<(), ForthError> {
+    forth.curr_def_addr = def_addr;
     // println!("forth.curr_def_addr: {:#x}", forth.curr_def_addr);
-    check_ptr(forth, addr as *const usize)?;
-    let word_ix = unsafe { *(addr as *const usize) };
+    let word_ix = forth.data_space.read_cell(def_addr)? as ForthUCell as usize;
     let maybe_builtin = if word_ix < SPECIAL_CODEWORDS.len() {
         Some(SPECIAL_CODEWORDS[word_ix])
     } else if word_ix - SPECIAL_CODEWORDS.len() < BUILTIN_WORDS.len() {
@@ -1422,7 +1528,7 @@ fn exec_fun_indirect(addr: usize, forth: &mut ForthMachine) -> Result<(), ForthE
     //     None => println!("Executing builtin fun at index {}", word_ix),
     //     Some((name, _)) => println!("Executing builtin '{}' (index {})", name, word_ix),
     // }
-    let builtin = maybe_builtin.ok_or(ForthError::InvalidPointer(word_ix))?;
+    let builtin = maybe_builtin.ok_or(ForthError::InvalidPointer(def_addr))?;
     let fun = builtin.1;
     match fun(forth) {
         e @ Err(..) => {
@@ -1434,14 +1540,13 @@ fn exec_fun_indirect(addr: usize, forth: &mut ForthMachine) -> Result<(), ForthE
 }
 
 fn next(forth: &mut ForthMachine) -> Result<(), ForthError> {
-    if forth.instruction_addr == 0 {
+    if forth.instruction_addr.is_null() {
         return Ok(());
     }
-    check_ptr(forth, forth.instruction_addr as *const usize)?;
-    let def_addr = unsafe { *(forth.instruction_addr as *const usize) };
+    let def_addr = ForthPtr(forth.data_space.read_cell(forth.instruction_addr)? as ForthUCell);
     forth.instruction_addr = forth
         .instruction_addr
-        .checked_add(PTR_SIZE)
+        .checked_add(FORTH_CELL_SIZE)
         .ok_or(ForthError::AddressOverflow(forth.instruction_addr))?;
     // println!("curr_def_addr at {:#x}", def_addr);
     // println!("instruction_addr at {:#x}", forth.instruction_addr);
@@ -1450,13 +1555,14 @@ fn next(forth: &mut ForthMachine) -> Result<(), ForthError> {
 
 // Store instruction at `def_addr` and return the address in `data_space` where
 // it was stored.
-fn push_instruction(data_space: &mut DataSpace, def_addr: usize) -> usize {
-    assert!(is_aligned(data_space.memory.current as usize, PTR_SIZE));
-    let ptr = data_space.alloc(PTR_SIZE).unwrap();
-    let instruction_buf = unsafe { std::slice::from_raw_parts_mut(ptr, PTR_SIZE) };
-    let mut cursor = std::io::Cursor::new(instruction_buf);
-    cursor.write_all(&def_addr.to_ne_bytes()).unwrap();
-    cursor.into_inner().as_ptr() as usize
+fn push_instruction(data_space: &mut DataSpace, def_addr: ForthUCell) -> ForthPtr {
+    assert!(is_aligned(
+        data_space.memory.current as usize,
+        FORTH_CELL_SIZE as usize
+    ));
+    let ptr = data_space.alloc(FORTH_CELL_SIZE as usize).unwrap();
+    data_space.write_cell(ptr, def_addr as ForthCell).unwrap();
+    ptr
 }
 
 fn push_word<'a, I>(data_space: &mut DataSpace, name: &str, flags: u8, words: I)
@@ -1464,41 +1570,41 @@ where
     I: IntoIterator<Item = &'a str>,
 {
     assert!(data_space.push_dict_entry(name, flags));
-    push_instruction(data_space, DOCOL_IX);
+    push_instruction(data_space, DOCOL_IX as ForthUCell);
     for word in words {
         match data_space.find_entry(word) {
             Some(entry) => {
-                push_instruction(data_space, entry.definition_addr());
+                push_instruction(data_space, entry.definition_addr().0);
             }
             None => {
                 let base = 10;
                 let num = parse_num(word, base).unwrap();
                 // push_instruction(
                 //     data_space,
-                //     data_space.find_entry("LIT").unwrap().definition_addr(),
+                //     data_space.find_entry("LIT").unwrap().definition_addr().0,
                 // );
-                push_instruction(data_space, num as usize);
+                push_instruction(data_space, num as ForthUCell);
             }
         };
     }
     let def_addr = data_space.find_entry("EXIT").unwrap().definition_addr();
-    push_instruction(data_space, def_addr);
+    push_instruction(data_space, def_addr.0);
 }
 
-fn push_variable(data_space: &mut DataSpace, name: &str, val: isize) -> *mut isize {
+fn push_variable(data_space: &mut DataSpace, name: &str, val: ForthCell) -> ForthPtr {
     assert!(data_space.push_dict_entry(name, 0));
     // TODO: Add a builtin `dovar` to save extra space by avoiding the offset ptr for
     // `docreate`. (See how `create_builtin` works).
-    push_instruction(data_space, DOCREATE_IX);
+    push_instruction(data_space, DOCREATE_IX as ForthUCell);
     push_instruction(data_space, 0);
-    push_instruction(data_space, val as usize) as *mut isize
+    push_instruction(data_space, val as ForthUCell)
 }
 
-fn push_buffer(data_space: &mut DataSpace, name: &str, bytes: usize) -> *mut u8 {
+fn push_buffer(data_space: &mut DataSpace, name: &str, bytes: usize) -> ForthPtr {
     assert!(data_space.push_dict_entry(name, 0));
     // TODO: Add a builtin `dovar` to save extra space by avoiding the offset ptr for
     // `docreate`. (See how `create_builtin` works).
-    push_instruction(data_space, DOCREATE_IX);
+    push_instruction(data_space, DOCREATE_IX as ForthUCell);
     push_instruction(data_space, 0);
     let ptr = data_space
         .alloc(bytes)
@@ -1510,7 +1616,7 @@ fn push_buffer(data_space: &mut DataSpace, name: &str, bytes: usize) -> *mut u8 
 fn set_instruction(forth: &mut ForthMachine, word: &str) {
     assert!(forth.data_space.align());
     let def_addr = forth.data_space.find_entry(word).unwrap().definition_addr();
-    forth.instruction_addr = push_instruction(&mut forth.data_space, def_addr);
+    forth.instruction_addr = push_instruction(&mut forth.data_space, def_addr.0);
 }
 
 fn parse_memsize(val: &str) -> clap::error::Result<usize> {
@@ -1595,7 +1701,7 @@ pub fn with_cli_args() -> ForthMachine {
         [
             "CREATE", // This will push `docreate` as codeword, and 0 ptr.
             "LIT",
-            &(-(PTR_SIZE as isize)).to_string(),
+            &(-(FORTH_CELL_SIZE as ForthCell)).to_string(),
             "ALLOT", // Deallocate the 0 ptr.
             "LIT",
             &DOCOL_IX.to_string(),
@@ -1626,9 +1732,9 @@ pub fn with_cli_args() -> ForthMachine {
             // ( len offset )
             "U>",
             "0BRANCH",
-            &(3 * PTR_SIZE).to_string(), // If false jump to exit.
-            "BRANCH",                    // If len > offset, repeat interpret.
-            &(-9 * PTR_SIZE as isize).to_string(),
+            &(3 * FORTH_CELL_SIZE).to_string(), // If false jump to exit.
+            "BRANCH",                           // If len > offset, repeat interpret.
+            &(-9 * FORTH_CELL_SIZE as ForthCell).to_string(),
         ],
     );
     push_word(
@@ -1639,10 +1745,10 @@ pub fn with_cli_args() -> ForthMachine {
             "RS-CLEAR",
             "REFILL",
             "0BRANCH",
-            &(4 * PTR_SIZE).to_string(),
+            &(4 * FORTH_CELL_SIZE).to_string(),
             "INTERPRET",
             "BRANCH",
-            &(-5 * PTR_SIZE as isize).to_string(),
+            &(-5 * FORTH_CELL_SIZE as ForthCell).to_string(),
             "BYE",
         ],
     );
@@ -1662,19 +1768,19 @@ pub fn run_with(forth: &mut ForthMachine, mut fun: impl FnMut(&mut ForthMachine)
     println!(
         "data_stack_size = {} cells ({} bytes)",
         forth.data_stack.max_elements,
-        fmt_memsize(forth.data_stack.max_elements * PTR_SIZE)
+        fmt_memsize(forth.data_stack.max_elements * FORTH_CELL_SIZE as usize)
     );
     println!(
         "return_stack_size = {} cells ({} bytes)",
         forth.return_stack.max_elements,
-        fmt_memsize(forth.return_stack.max_elements * PTR_SIZE)
+        fmt_memsize(forth.return_stack.max_elements * FORTH_CELL_SIZE as usize)
     );
     // This needs to allocate a PTR_SIZE to store indirect address of QUIT.
     set_instruction(forth, "QUIT");
     // We will reuse the allocated indirect address to reset the state on error.
     let quit_instruction_addr = forth.instruction_addr;
     println!("unused {} bytes", fmt_memsize(forth.data_space.unused()));
-    while forth.instruction_addr != 0 {
+    while !forth.instruction_addr.is_null() {
         if let Err(e) = next(forth) {
             println!("ERROR: {:?}", e);
             println!("  Backtrace");
@@ -1683,20 +1789,17 @@ pub fn run_with(forth: &mut ForthMachine, mut fun: impl FnMut(&mut ForthMachine)
             }
             forth.backtrace.clear();
             // Reset the instruction_addr back to QUIT.
-            {
-                // TODO: This allows for redefined QUIT, but that brings additional
-                // problems. Perhaps hard code it back to original QUIT.
-                let quit_def_addr = forth
-                    .data_space
-                    .find_entry("QUIT")
-                    .unwrap()
-                    .definition_addr();
-                let quit_instruction_buf = unsafe {
-                    std::slice::from_raw_parts_mut(quit_instruction_addr as *mut u8, PTR_SIZE)
-                };
-                let mut cursor = std::io::Cursor::new(quit_instruction_buf);
-                cursor.write_all(&quit_def_addr.to_ne_bytes()).unwrap();
-            }
+            // TODO: This allows for redefined QUIT, but that brings additional problems. Perhaps
+            // hard code it back to original QUIT.
+            let quit_def_addr = forth
+                .data_space
+                .find_entry("QUIT")
+                .unwrap()
+                .definition_addr();
+            forth
+                .data_space
+                .write_cell(quit_instruction_addr, quit_def_addr.0 as ForthCell)
+                .unwrap();
             forth.instruction_addr = quit_instruction_addr;
         }
         fun(forth);
