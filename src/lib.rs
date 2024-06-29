@@ -558,6 +558,18 @@ impl DataSpace {
         None
     }
 
+    pub fn find_entry_by_def_addr(&self, def_addr: ForthPtr) -> Option<DictEntryRef<'_>> {
+        let mut maybe_entry = self.latest_entry();
+        while let Some(entry) = maybe_entry {
+            if entry.definition_addr() == def_addr {
+                return maybe_entry;
+            } else {
+                maybe_entry = entry.prev();
+            }
+        }
+        None
+    }
+
     pub fn push_builtin_word(&mut self, name: &str, flags: u8, word_ix: usize) {
         assert!(self.push_dict_entry(name, flags));
         let word_ix: ForthUCell = (word_ix + SPECIAL_CODEWORDS.len()).try_into().unwrap();
@@ -768,10 +780,8 @@ pub struct ForthMachine {
     // Stdin line parse area inside `data_space`; length is INPUT_BUFFER_SIZE.
     input_buffer_ptr: ForthPtr,
     state: ForthState,
-    // Backtrace of words when error happens. (this is only from
-    // exec_fun_indirect, we need to traverse the return stack and try
-    // decompiling)
-    backtrace: Vec<String>,
+    // Backtrace of word definition_addr when error happens.
+    backtrace: Vec<ForthPtr>,
 }
 
 impl ForthMachine {
@@ -918,6 +928,7 @@ fn rot_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
 // used when creating new words (via DOCOL_IX).
 // TODO: Maybe make a DOCOL word (constant) that pushes DOCOL_IX on stack.
 fn docol(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    forth.backtrace.push(forth.curr_def_addr);
     let ret_addr = forth.instruction_addr.0 as ForthCell;
     rs_push(forth, ret_addr)?;
     forth.instruction_addr = forth
@@ -929,6 +940,7 @@ fn docol(forth: &mut ForthMachine) -> Result<(), ForthError> {
 
 fn exit_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
     forth.instruction_addr = ForthPtr(rs_pop(forth)? as ForthUCell);
+    forth.backtrace.pop();
     Ok(())
 }
 
@@ -1236,6 +1248,7 @@ fn docreate(forth: &mut ForthMachine) -> Result<(), ForthError> {
         .ok_or(ForthError::AddressOverflow(instr_addr_ptr))?;
     ds_push(forth, data_addr.0 as ForthCell)?;
     if !instr_addr.is_null() {
+        forth.backtrace.push(forth.curr_def_addr);
         let ret_addr = forth.instruction_addr.0 as ForthCell;
         rs_push(forth, ret_addr)?;
         forth.instruction_addr = instr_addr;
@@ -1567,7 +1580,10 @@ fn exec_fun_indirect(def_addr: ForthPtr, forth: &mut ForthMachine) -> Result<(),
     let fun = builtin.1;
     match fun(forth) {
         e @ Err(..) => {
-            forth.backtrace.push(builtin.0.to_string());
+            // TODO: This doesn't work well when recursive `exec_fun_indirect` is combined with
+            // `next`. For example, builtins will show `INTERPRET-SINGLE` at incorrect place, while
+            // `docol` will omit `INTERPRET-SINGLE` from the backtrace.
+            forth.backtrace.push(def_addr);
             e
         }
         r => r,
@@ -1819,8 +1835,13 @@ pub fn run_with(forth: &mut ForthMachine, mut fun: impl FnMut(&mut ForthMachine)
         if let Err(e) = next(forth) {
             println!("ERROR: {:?}", e);
             println!("  Backtrace");
-            for (ix, w) in forth.backtrace.iter().enumerate() {
-                println!("    {}: {}", ix, w);
+            for (ix, def_addr) in forth.backtrace.iter().rev().enumerate() {
+                let word_name = forth
+                    .data_space
+                    .find_entry_by_def_addr(*def_addr)
+                    .map(|entry| entry.name().to_string())
+                    .unwrap_or_else(|| "<UNKOWN-WORD>".to_string());
+                println!("    {}: {}", ix, word_name);
             }
             forth.backtrace.clear();
             // Reset the instruction_addr back to QUIT.
