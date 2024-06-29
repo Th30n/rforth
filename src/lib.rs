@@ -12,6 +12,21 @@ pub type ForthCell = i16;
 /// Unsigned cell type which fits FORTH_CELL_SIZE.
 pub type ForthUCell = u16;
 
+/// Double cell type.
+pub type ForthDCell = i32;
+
+pub fn unpack_forth_d_cell(d: ForthDCell) -> (ForthCell, ForthCell) {
+    let b = (d >> (FORTH_CELL_SIZE * 8)) as ForthCell;
+    let a = d as ForthCell;
+    (a, b)
+}
+
+pub fn pack_forth_d_cell(a: ForthCell, b: ForthCell) -> ForthDCell {
+    // Treat `a` as bits, so cast to ForthUCell before casting to ForthDCell to avoid sign
+    // extension.
+    ((b as ForthDCell) << (FORTH_CELL_SIZE * 8)) | a as ForthUCell as ForthDCell
+}
+
 /// Forth address into data space.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ForthPtr(ForthUCell);
@@ -1332,6 +1347,29 @@ fn mul_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
     ds_push(forth, a.wrapping_mul(b))
 }
 
+// ( n1 n2 -- d )
+fn m_mul_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let n2 = ds_pop(forth)? as ForthDCell;
+    let n1 = ds_pop(forth)? as ForthDCell;
+    let d = n1 * n2;
+    let (a, b) = unpack_forth_d_cell(d);
+    ds_push(forth, a)?;
+    ds_push(forth, b)
+}
+
+// ( d1 n1 -- n2 n3 )
+//
+// d1 = n3 * n1 + n2 n3 is the symmetric quotient, n2 is the remainder.
+// This is the same behavior as /MOD (slash_mod_builtin).
+fn sm_slash_rem_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let n1 = ds_pop(forth)? as ForthDCell;
+    let d1_b = ds_pop(forth)?;
+    let d1_a = ds_pop(forth)?;
+    let d1 = pack_forth_d_cell(d1_a, d1_b);
+    ds_push(forth, (d1 % n1) as ForthCell)?;
+    ds_push(forth, (d1 / n1) as ForthCell)
+}
+
 fn slash_mod_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
     let b = ds_pop(forth)?;
     let a = ds_pop(forth)?;
@@ -1340,6 +1378,12 @@ fn slash_mod_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
     }
     ds_push(forth, a % b)?;
     ds_push(forth, a / b)
+}
+
+fn s_to_d_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
+    let a = ds_last(forth)?;
+    let b = if a < 0 { -1 } else { 0 };
+    ds_push(forth, b)
 }
 
 fn abs_builtin(forth: &mut ForthMachine) -> Result<(), ForthError> {
@@ -1430,7 +1474,7 @@ const DOCREATE_IX: usize = 1;
 const SPECIAL_CODEWORDS: [(&str, fn(&mut ForthMachine) -> Result<(), ForthError>); 2] =
     [("DOCOL", docol), ("DOCREATE", docreate)];
 
-const BUILTIN_WORDS: [(&str, u8, fn(&mut ForthMachine) -> Result<(), ForthError>); 55] = [
+const BUILTIN_WORDS: [(&str, u8, fn(&mut ForthMachine) -> Result<(), ForthError>); 58] = [
     // Stack manipulation
     (".S", 0, print_data_stack_builtin),
     ("DROP", 0, drop_builtin),
@@ -1446,6 +1490,9 @@ const BUILTIN_WORDS: [(&str, u8, fn(&mut ForthMachine) -> Result<(), ForthError>
     ("=", 0, eq_builtin),
     (">", 0, greater_than_builtin),
     ("ABS", 0, abs_builtin),
+    ("M*", 0, m_mul_builtin),
+    ("S>D", 0, s_to_d_builtin),
+    ("SM/REM", 0, sm_slash_rem_builtin),
     ("U>", 0, u_greater_than_builtin),
     // Bit operations
     ("AND", 0, and_builtin),

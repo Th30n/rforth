@@ -158,15 +158,15 @@ DOES>
 
 : /  /MOD NIP ;
 
-\ n4 = (n1 * n2) / n3
-\ TODO: result of n1 * n2 should use double cell.
-\ ( n1 n2 n3 -- n4 )
-: */  >R * R> / ;
-
-\ n5 = (n1 * n2) / n3 + n4
-\ TODO: result of n1 * n2 should use double cell.
 \ ( n1 n2 n3 -- n4 n5 )
-: */MOD  >R * R> /MOD ;
+\ n5 = (n1 * n2) / n3 + n4
+\ Intermediary result is a double-cell.
+: */MOD  >R M* R> SM/REM ;
+
+\ ( n1 n2 n3 -- n4 )
+\ n4 = (n1 * n2) / n3
+\ Intermediary result is a double-cell.
+: */  */MOD NIP ;
 
 \ Add n|u to single cell number at a-addr
 \ ( n|u a-addr -- )
